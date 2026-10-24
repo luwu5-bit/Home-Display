@@ -18,12 +18,24 @@ Kleines Display für zu Hause, das die aktuellen Abfahrtszeiten der Wiener Linie
 - Endpoint: `https://www.wienerlinien.at/ogd_realtime/monitor?stopId=<ID>` (mehrere `stopId` Parameter möglich)
 - Haltestellen-IDs aus der offiziellen OGD-Haltepunkte-Liste der Wiener Linien
 - Abfrage etwa alle 30 bis 60 Sekunden, nicht öfter
-- Haltestellen: noch festzulegen
+- Antworten mit `http.useHTTP10(true)` abfragen, sonst kommen sie "chunked" und ArduinoJson kann sie nicht lesen
+- Haltestellen (eingestellt in `STOPS` in `src/main.cpp`):
+  - U2 Museumsquartier Richtung Seestadt, RBL 4204, oben. 7 Minuten Fußweg, Abfahrten unter 7 Minuten werden ausgeblendet. Ziel pro Zug aus der API (Seestadt oder Aspernstraße)
+  - 57A Köstlergasse Richtung Rudolfsheim Anschützgasse, RBL 8227, unten. Keine Gehzeit, Ziel wird als "Rudolfsheim" angezeigt
+
+## Wetter
+- Open-Meteo für Wien, kein API-Key nötig, Abfrage alle 15 Minuten
+- Kopfzeile links: aktuelle Temperatur, Tagesmaximum, dann "Regen jetzt", "Regen ab 17 Uhr" (ab 50 % Wahrscheinlichkeit, nächste 12 Stunden) oder sonst das aktuelle Wetter (z.B. bewölkt, sonnig)
+- Bei Fehler grau "Wetter nicht verfügbar"
 
 ## Anzeige
-- Pro Linie: Linie, Richtung, Minuten bis zur Abfahrt (die nächsten 2)
-- Platz für etwa 3 bis 4 Linien, sonst Seiten durchwechseln
+- Stil wie die U-Bahn Anzeigen der Wiener Linien: schwarzer Hintergrund, gelbe Schrift (RGB 255,230,0, am Display ausgewählt)
+- Schrift: U8g2_for_TFT_eSPI (wegen Umlauten), helvB (Helvetica fett), am Display ausgewählt
+- Kopfzeile: Wetter links, Uhrzeit (NTP, Wiener Zeit) rechts
+- Darunter 2 Hälften, je eine Linie: Liniennummer groß links, gelber Trennstrich, Haltestelle klein grau, 2 Zeilen mit Ziel in Großbuchstaben und Minuten rechts
+- Alle Ziele in gleicher Schriftgröße (helvB14), nur bei zu langen Namen kleiner
 - Bei WLAN- oder API-Fehler eine klare Meldung anzeigen statt alte Daten
+- Partition `huge_app.csv`, da Schriften viel Flash brauchen
 
 ## Arbeitsweise
 - Luca ist Einsteiger bei Mikrocontrollern und arbeitet lieber mit grafischen Oberflächen als im Terminal: Schritte so erklären, dass sie in VS Code per Klick gehen
