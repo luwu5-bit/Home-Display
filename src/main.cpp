@@ -7,25 +7,58 @@
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
 #include <U8g2_for_TFT_eSPI.h>
+#include <SPI.h>
+#include <XPT2046_Touchscreen.h>
 #include <time.h>
 #include "secrets.h"
+#include "fahrplan.h"  // erzeugt von tools/fahrplan.py
 
-// Haltestellen (RBL Nummern aus der OGD Haltepunkte Liste)
-// Reihenfolge hier = Reihenfolge am Bildschirm (oben, unten)
+// Ein Steig: RBL Nummer aus der OGD Haltepunkte Liste für die Live Daten und
+// der passende Fahrplan, der angezeigt wird, wenn keine Live Daten kommen
+struct Source {
+  int rbl;
+  FpSourceId timetable;
+};
+
+// Ein Block am Bildschirm = eine Linie an einer Haltestelle
 // minMinutes: Abfahrten, die früher kommen, sind nicht erreichbar und werden ausgeblendet
 // towards: eigener kurzer Name für das Ziel, nullptr = Ziel aus der API
-struct Stop {
-  int rbl;
+// sources: ein Steig = die nächsten 2 Abfahrten, zwei Steige = je Richtung die nächste
+struct Block {
+  const char *line;
   const char *station;
   int minMinutes;
   const char *towards;
+  Source sources[2];
 };
 
-const Stop STOPS[] = {
-    {4204, "Museumsquartier", 5, nullptr},     // U2 Richtung Seestadt, 7 Minuten Fußweg
-    {8227, "Köstlergasse", 0, "Rudolfsheim"},  // 57A Richtung Rudolfsheim Anschützgasse
+// Je 2 Blöcke bilden eine Seite (oben, unten)
+const Block BLOCKS[] = {
+    // Seite 1
+    {"U2", "Museumsquartier", 5, nullptr, {{4204, FP_U2_MUSEUMSQUARTIER}}},
+    {"57A", "Köstlergasse", 0, "Rudolfsheim", {{8227, FP_57A_KOESTLERGASSE}}},
+    // Seite 2: beide Richtungen
+    {"U4", "Kettenbrückengasse", 5, nullptr,
+     {{4418, FP_U4_KETTENBRUECKENGASSE_HUETTELDORF},
+      {4419, FP_U4_KETTENBRUECKENGASSE_HEILIGENSTADT}}},
+    {"U3", "Neubaugasse", 5, nullptr,
+     {{4918, FP_U3_NEUBAUGASSE_OTTAKRING}, {4923, FP_U3_NEUBAUGASSE_SIMMERING}}},
+    // Seite 3: 13A und 14A halten am selben Steig
+    {"13A", "Haus des Meeres", 0, nullptr, {{668, FP_13A_HAUS_DES_MEERES}}},
+    {"14A", "Haus des Meeres", 0, nullptr, {{668, FP_14A_HAUS_DES_MEERES}}},
 };
-const int STOP_COUNT = sizeof(STOPS) / sizeof(STOPS[0]);
+const int BLOCK_COUNT = sizeof(BLOCKS) / sizeof(BLOCKS[0]);
+const int PAGE_COUNT = (BLOCK_COUNT + 1) / 2;
+
+// Touch (XPT2046, eigene Pins laut lcdwiki E32R28T)
+const int TOUCH_CS = 33;
+const int TOUCH_IRQ = 36;
+const int TOUCH_SCLK = 25;
+const int TOUCH_MISO = 39;
+const int TOUCH_MOSI = 32;
+const bool TOUCH_FLIP_Y = false;  // auf true setzen, falls rauf und runter vertauscht sind
+const int SWIPE_MIN = 800;        // Mindestweg für einen Wisch (Rohwerte 0 bis 4095)
+const unsigned long PAGE_TIMEOUT_MS = 90000;  // danach zurück zur ersten Seite
 
 const char *API_BASE = "https://www.wienerlinien.at/ogd_realtime/monitor?";
 const char *TIMEZONE = "CET-1CEST,M3.5.0,M10.5.0/3";  // Wien, mit Sommerzeit
@@ -39,25 +72,30 @@ const int RAIN_CHANCE = 50;  // ab dieser Regenwahrscheinlichkeit in % gilt es a
 
 const unsigned long REFRESH_MS = 30000;          // Abfahrten alle 30 Sekunden
 const unsigned long WEATHER_MS = 15 * 60000UL;  // Wetter alle 15 Minuten
-const int MAX_ROWS = 4;
 
 // Farben im Stil der U-Bahn Anzeigen
 const uint16_t COLOR_LED = 0xFF20;   // Gelb, RGB 255,230,0 (Farbtest B)
 const uint16_t COLOR_DIM = 0x8410;   // Grau
 const uint16_t COLOR_ERROR = 0xF800; // Rot
+const uint16_t COLOR_LIVE = 0x07E0;  // Grün, Punkt für Live Daten
 
 TFT_eSPI tft;
 U8g2_for_TFT_eSPI u8f;
+SPIClass touchSpi(VSPI);
+XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
 
+// Abfahrten pro Block, in der Reihenfolge von BLOCKS
 struct Row {
-  String station;
-  String line;
+  int count;          // Anzahl Abfahrten (0 bis 2)
   String towards[2];  // Ziel pro Abfahrt
-  int next[2];        // Minuten, -1 = keine Abfahrt
+  String when[2];     // Minuten ("7") oder Uhrzeit ab einer Stunde ("05:33")
+  bool live[2];       // true = Live Daten, false = Fahrplan
 };
 
-Row rows[MAX_ROWS];
-int rowCount = 0;
+Row rows[BLOCK_COUNT];
+bool hasData = false;  // false = gerade wird eine Fehlermeldung angezeigt
+int currentPage = 0;
+unsigned long lastTouch = 0;
 unsigned long lastFetch = 0;
 unsigned long lastWeather = 0;
 String weatherText;  // leer = kein Wetter verfügbar
@@ -192,7 +230,8 @@ void fetchWeather() {
 bool connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return true;
 
-  showStatus("WLAN...", WIFI_SSID, COLOR_LED);
+  // Nur beim Start anzeigen, sonst bleiben die Abfahrten (Fahrplan) stehen
+  if (!hasData) showStatus("WLAN...", WIFI_SSID, COLOR_LED);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
@@ -203,12 +242,16 @@ bool connectWiFi() {
   return WiFi.status() == WL_CONNECTED;
 }
 
-// Holt die Abfahrten. Gibt bei Erfolg einen leeren String zurück, sonst die Fehlermeldung.
-String fetchDepartures() {
+// Holt die Live Abfahrten in doc. Gibt bei Erfolg einen leeren String zurück, sonst den Fehler.
+String fetchDepartures(JsonDocument &doc) {
   String url = API_BASE;
-  for (int i = 0; i < STOP_COUNT; i++) {
-    if (i > 0) url += "&";
-    url += "stopId=" + String(STOPS[i].rbl);
+  for (const Block &b : BLOCKS) {
+    for (const Source &s : b.sources) {
+      String param = "stopId=" + String(s.rbl);
+      if (s.rbl == 0 || url.indexOf(param + "&") >= 0 || url.endsWith(param)) continue;
+      if (!url.endsWith("?")) url += "&";
+      url += param;
+    }
   }
 
   WiFiClientSecure client;
@@ -235,59 +278,148 @@ String fetchDepartures() {
   fDep["departureTime"]["countdown"] = true;
   fDep["vehicle"]["towards"] = true;  // Ziel pro Zug (U2: Seestadt oder Aspernstraße)
 
-  JsonDocument doc;
   DeserializationError err =
       deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter),
                       DeserializationOption::NestingLimit(20));
   http.end();
   if (err) return String("JSON Fehler: ") + err.c_str();
+  return "";
+}
 
-  rowCount = 0;
-  JsonArray monitors = doc["data"]["monitors"];
-  // In der Reihenfolge von STOPS durchgehen, damit die U2 immer oben steht
-  for (const Stop &stop : STOPS) {
-    for (JsonObject monitor : monitors) {
-      if ((monitor["locationStop"]["properties"]["attributes"]["rbl"] | 0) != stop.rbl) continue;
+// Tage seit 1.1.1970 für ein Datum (wie in fahrplan.h)
+int32_t daysSinceEpoch(int year, int month, int day) {
+  year -= month <= 2;
+  int32_t era = (year >= 0 ? year : year - 399) / 400;
+  int yoe = year - era * 400;
+  int doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+  int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
 
-      JsonArray lines = monitor["lines"];
-      for (JsonObject line : lines) {
-        if (rowCount >= MAX_ROWS) break;
-        Row &r = rows[rowCount++];
-        r.station = stop.station;
-        r.line = line["name"].as<String>();
+// Sucht im Fahrplan die nächsten Abfahrten ab fromMinute (Minuten seit heute 00:00).
+// Berücksichtigt gestern (Fahrten nach Mitternacht), heute und morgen.
+// Gibt die Anzahl gefundener Abfahrten zurück, sortiert nach Zeit.
+int timetableDepartures(FpSourceId id, int32_t today, int fromMinute, int maxCount,
+                        int minutes[], const char *heads[]) {
+  const FpSource &src = FP_SOURCES[id];
+  int count = 0;
+  for (int offset = -1; offset <= 1; offset++) {
+    int dayIndex = today + offset - FP_FIRST_DAY;
+    if (dayIndex < 0 || dayIndex >= FP_DAY_COUNT) continue;
+    int pattern = src.dayPattern[dayIndex];
+    const uint16_t *times = src.patterns[pattern];
+    for (int i = 0; i < src.patternSizes[pattern]; i++) {
+      int t = (times[i] & 0x0FFF) + offset * 1440;
+      if (t < fromMinute) continue;
+      // In die sortierte Liste einfügen, nur die frühesten maxCount behalten
+      int pos = count;
+      while (pos > 0 && minutes[pos - 1] > t) pos--;
+      if (pos >= maxCount) continue;
+      for (int j = min(count, maxCount - 1); j > pos; j--) {
+        minutes[j] = minutes[j - 1];
+        heads[j] = heads[j - 1];
+      }
+      minutes[pos] = t;
+      heads[pos] = src.heads[times[i] >> 12];
+      if (count < maxCount) count++;
+    }
+  }
+  return count;
+}
 
-        // Die nächsten 2 Abfahrten, die noch erreichbar sind
-        r.next[0] = r.next[1] = -1;
-        int found = 0;
-        JsonArray departures = line["departures"]["departure"];
-        for (JsonObject dep : departures) {
-          int minutes = dep["departureTime"]["countdown"] | -1;
-          if (minutes < stop.minMinutes) continue;
-          String towards = stop.towards ? String(stop.towards) : dep["vehicle"]["towards"].as<String>();
-          r.towards[found] = toUpper(towards);
-          r.next[found++] = minutes;
-          if (found == 2) break;
+// Minuten bis zur Abfahrt als Text: "7", ab einer Stunde als Uhrzeit "05:33"
+String formatWhen(int minutes, const struct tm *now) {
+  if (minutes < 60 || !now) return String(minutes);
+  int t = (now->tm_hour * 60 + now->tm_min + minutes) % 1440;
+  char text[8];
+  snprintf(text, sizeof(text), "%02d:%02d", t / 60, t % 60);
+  return text;
+}
+
+// Füllt rows: Live Daten, wo vorhanden, sonst Fahrplan. doc = nullptr, wenn keine Live Daten.
+// Gibt false zurück, wenn gar nichts angezeigt werden kann (keine Live Daten und keine Uhrzeit).
+bool fillRows(JsonDocument *doc) {
+  struct tm now;
+  bool hasTime = getLocalTime(&now, 0);
+  if (!doc && !hasTime) return false;
+
+  int32_t today = hasTime ? daysSinceEpoch(now.tm_year + 1900, now.tm_mon + 1, now.tm_mday) : 0;
+  int nowMinute = hasTime ? now.tm_hour * 60 + now.tm_min : 0;
+  JsonArray monitors;
+  if (doc) monitors = (*doc)["data"]["monitors"];
+
+  for (int i = 0; i < BLOCK_COUNT; i++) {
+    const Block &block = BLOCKS[i];
+    Row &r = rows[i];
+    r.count = 0;
+
+    // Ein Steig: die nächsten 2 Abfahrten. Zwei Steige: je Richtung die nächste.
+    int sourceCount = block.sources[1].rbl ? 2 : 1;
+    int perSource = 2 / sourceCount;
+
+    for (int s = 0; s < sourceCount; s++) {
+      const Source &source = block.sources[s];
+      int found = 0;
+      int lastLive = -1;
+
+      // Live Daten. Nachts fehlen Haltestellen ohne Abfahrten in der Antwort ganz.
+      for (JsonObject monitor : monitors) {
+        if ((monitor["locationStop"]["properties"]["attributes"]["rbl"] | 0) != source.rbl) continue;
+        JsonArray lines = monitor["lines"];
+        for (JsonObject line : lines) {
+          if (line["name"] != block.line) continue;  // z.B. 13A und 14A am selben Steig
+          JsonArray departures = line["departures"]["departure"];
+          for (JsonObject dep : departures) {
+            if (found == perSource) break;
+            int minutes = dep["departureTime"]["countdown"] | -1;
+            if (minutes < block.minMinutes) continue;
+            String towards =
+                block.towards ? String(block.towards) : dep["vehicle"]["towards"].as<String>();
+            r.towards[r.count] = toUpper(towards);
+            r.when[r.count] = formatWhen(minutes, hasTime ? &now : nullptr);
+            r.live[r.count++] = true;
+            lastLive = minutes;
+            found++;
+          }
+        }
+      }
+
+      // Was fehlt, kommt aus dem Fahrplan (z.B. nachts die erste Abfahrt am Morgen)
+      if (found < perSource && hasTime) {
+        int from = nowMinute + max(block.minMinutes, lastLive + 2);
+        int minutes[2];
+        const char *heads[2];
+        int n = timetableDepartures(source.timetable, today, from, perSource - found, minutes, heads);
+        for (int k = 0; k < n; k++) {
+          r.towards[r.count] = toUpper(block.towards ? block.towards : heads[k]);
+          r.when[r.count] = formatWhen(minutes[k] - nowMinute, &now);
+          r.live[r.count++] = false;
         }
       }
     }
   }
-
-  if (rowCount == 0) return "Keine Abfahrten";
-  return "";
+  return true;
 }
 
 // Ein Block pro Linie, wie die Anzeige am Bahnsteig:
-// Linie links, Trennstrich, Ziel, Minuten rechts
-void drawBlock(const Row &r, int y, int h) {
+// Linie links, Trennstrich, Ziel, Minuten (oder Uhrzeit laut Fahrplan) rechts
+void drawBlock(const Block &b, const Row &r, int y, int h) {
   const int lineX = 72;  // Trennstrich
   const int destX = lineX + 10;
   const int minutesRight = tft.width() - 8;
-  const int destMaxWidth = minutesRight - 46 - destX;
 
   // Linie links, senkrecht mittig
   u8f.setFont(u8g2_font_helvB24_tf);
   u8f.setForegroundColor(COLOR_LED);
-  u8f.drawUTF8(8, y + h / 2 + 12, r.line.c_str());
+  u8f.drawUTF8(8, y + h / 2 + 12, b.line);
+
+  // Grüner Punkt unter der Linie, wenn alle Abfahrten live sind
+  bool allLive = r.count > 0;
+  for (int k = 0; k < r.count; k++) allLive = allLive && r.live[k];
+  if (allLive) {
+    int lineWidth = u8f.getUTF8Width(b.line);
+    tft.fillCircle(8 + lineWidth / 2, y + h / 2 + 26, 3, COLOR_LIVE);
+  }
 
   // Trennstrich
   tft.drawFastVLine(lineX, y + 10, h - 20, COLOR_LED);
@@ -296,24 +428,27 @@ void drawBlock(const Row &r, int y, int h) {
   // Haltestelle klein darüber
   u8f.setFont(u8g2_font_helvB10_tf);
   u8f.setForegroundColor(COLOR_DIM);
-  u8f.drawUTF8(destX, y + 20, r.station.c_str());
+  u8f.drawUTF8(destX, y + 20, b.station);
 
   // Zwei Zeilen: Ziel und Minuten
-  for (int k = 0; k < 2; k++) {
+  if (r.count == 0) {
+    u8f.setFont(u8g2_font_helvB12_tf);
+    u8f.setForegroundColor(COLOR_DIM);
+    u8f.drawUTF8(destX, y + 52, "Keine Abfahrt gefunden");
+  }
+
+  for (int k = 0; k < r.count; k++) {
     int baseline = y + 52 + k * 32;
-    if (r.next[k] < 0) {
-      if (k == 0) {
-        u8f.setFont(u8g2_font_helvB12_tf);
-        u8f.setForegroundColor(COLOR_DIM);
-        u8f.drawUTF8(destX, baseline, "Keine Abfahrt erreichbar");
-      }
-      continue;
-    }
-    u8f.setFont(fitFont(r.towards[k].c_str(), destMaxWidth));
+
+    // Uhrzeiten sind breiter als Minuten, deshalb etwas kleiner
+    bool isTime = r.when[k].indexOf(':') >= 0;
+    const uint8_t *whenFont = isTime ? u8g2_font_helvB18_tf : u8g2_font_helvB24_tf;
+    drawRight(r.when[k].c_str(), minutesRight, baseline + 2, whenFont, COLOR_LED);
+
+    int whenWidth = max(46, (int)u8f.getUTF8Width(r.when[k].c_str()) + 10);
+    u8f.setFont(fitFont(r.towards[k].c_str(), minutesRight - whenWidth - destX));
     u8f.setForegroundColor(COLOR_LED);
     u8f.drawUTF8(destX, baseline, r.towards[k].c_str());
-    drawRight(String(r.next[k]).c_str(), minutesRight, baseline + 2, u8g2_font_helvB24_tf,
-              COLOR_LED);
   }
 }
 
@@ -322,33 +457,84 @@ void drawDepartures() {
   drawHeader();
   tft.drawFastHLine(0, 30, tft.width(), COLOR_DIM);
 
-  // Bis zu 2 Linien gleichzeitig, der Bildschirm ist sonst zu voll
-  int shown = min(rowCount, 2);
+  // 2 Blöcke pro Seite, der Bildschirm ist sonst zu voll
   int blockH = (tft.height() - 32) / 2;
-  for (int i = 0; i < shown; i++) {
-    drawBlock(rows[i], 32 + i * blockH, blockH);
+  for (int k = 0; k < 2; k++) {
+    int i = currentPage * 2 + k;
+    if (i >= BLOCK_COUNT) break;
+    drawBlock(BLOCKS[i], rows[i], 32 + k * blockH, blockH);
   }
   tft.drawFastHLine(0, 32 + blockH, tft.width(), COLOR_DIM);
+
+  // Seitenanzeige: Punkte unten in der Mitte
+  for (int p = 0; p < PAGE_COUNT; p++) {
+    int x = tft.width() / 2 + (p * 2 - (PAGE_COUNT - 1)) * 6;
+    tft.fillCircle(x, tft.height() - 5, 2, p == currentPage ? COLOR_LED : COLOR_DIM);
+  }
 }
 
-void update() {
-  if (!connectWiFi()) {
-    showStatus("WLAN Fehler", "Keine Verbindung", COLOR_ERROR);
+void showPage(int page) {
+  currentPage = (page + PAGE_COUNT) % PAGE_COUNT;
+  if (hasData) drawDepartures();
+}
+
+// Touch auswerten: runterwischen oder unten tippen = nächste Seite,
+// raufwischen oder oben tippen = vorige Seite
+void handleTouch() {
+  static bool down = false;
+  static int startY = 0, lastY = 0;
+  static unsigned long lastSeen = 0;
+
+  if (touch.touched()) {
+    TS_Point p = touch.getPoint();
+    int y = TOUCH_FLIP_Y ? 4095 - p.y : p.y;
+    if (!down) {
+      down = true;
+      startY = y;
+    }
+    lastY = y;
+    lastSeen = millis();
     return;
   }
 
-  if (lastWeather == 0 || weatherText.length() == 0 || millis() - lastWeather >= WEATHER_MS) {
+  // Erst als losgelassen werten, wenn kurz kein Druck mehr da war (resistiver Touch flackert)
+  if (!down || millis() - lastSeen < 80) return;
+  down = false;
+  lastTouch = millis();
+
+  int dy = lastY - startY;
+  Serial.printf("Touch: Start y=%d, Ende y=%d\n", startY, lastY);
+  if (dy > SWIPE_MIN) showPage(currentPage + 1);
+  else if (dy < -SWIPE_MIN) showPage(currentPage - 1);
+  else if (startY > 2048) showPage(currentPage + 1);
+  else showPage(currentPage - 1);
+}
+
+// Holt Live Daten und Wetter. Klappt das nicht, zeigen die Linien den Fahrplan.
+// Eine Fehlermeldung kommt nur, wenn gar nichts angezeigt werden kann.
+void update() {
+  bool wifiOk = connectWiFi();
+  String error = wifiOk ? "" : "Keine WLAN Verbindung";
+
+  if (!wifiOk) {
+    weatherText = "";  // kein altes Wetter anzeigen
+  } else if (lastWeather == 0 || weatherText.length() == 0 || millis() - lastWeather >= WEATHER_MS) {
     lastWeather = millis();
     fetchWeather();
   }
 
-  String error = fetchDepartures();
-  if (error.length() > 0) {
-    showStatus("API Fehler", error.c_str(), COLOR_ERROR);
-    Serial.println("API Fehler: " + error);
+  JsonDocument doc;
+  if (wifiOk) error = fetchDepartures(doc);
+  if (error.length() > 0) Serial.println("Keine Live Daten: " + error);
+
+  if (!fillRows(error.length() == 0 ? &doc : nullptr)) {
+    // Ohne Live Daten und ohne Uhrzeit geht auch der Fahrplan nicht
+    hasData = false;
+    showStatus(wifiOk ? "API Fehler" : "WLAN Fehler", error.c_str(), COLOR_ERROR);
     return;
   }
 
+  hasData = true;
   drawDepartures();
 }
 
@@ -356,9 +542,13 @@ void setup() {
   Serial.begin(115200);
 
   tft.init();
-  tft.setRotation(1);  // Querformat
+  tft.setRotation(3);  // Querformat, um 180 Grad gedreht (USB Anschluss auf der anderen Seite)
   u8f.begin(tft);
   u8f.setFontMode(1);  // transparenter Hintergrund
+
+  touchSpi.begin(TOUCH_SCLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
+  touch.begin(touchSpi);
+  touch.setRotation(3);  // wie das Display
 
   connectWiFi();
   configTzTime(TIMEZONE, "pool.ntp.org");  // Uhrzeit aus dem Internet
@@ -373,10 +563,15 @@ void loop() {
     update();
   }
 
+  handleTouch();
+
+  // Nach einer Weile ohne Berührung zurück zur ersten Seite
+  if (currentPage != 0 && millis() - lastTouch >= PAGE_TIMEOUT_MS) showPage(0);
+
   // Uhr jede Minute neu zeichnen (nur wenn gerade Abfahrten angezeigt werden)
   struct tm now;
   if (lastClockMinute >= 0 && getLocalTime(&now, 0) && now.tm_min != lastClockMinute) {
     drawHeader();
   }
-  delay(200);
+  delay(20);
 }

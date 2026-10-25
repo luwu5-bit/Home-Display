@@ -19,9 +19,15 @@ Kleines Display für zu Hause, das die aktuellen Abfahrtszeiten der Wiener Linie
 - Haltestellen-IDs aus der offiziellen OGD-Haltepunkte-Liste der Wiener Linien
 - Abfrage etwa alle 30 bis 60 Sekunden, nicht öfter
 - Antworten mit `http.useHTTP10(true)` abfragen, sonst kommen sie "chunked" und ArduinoJson kann sie nicht lesen
-- Haltestellen (eingestellt in `STOPS` in `src/main.cpp`):
-  - U2 Museumsquartier Richtung Seestadt, RBL 4204, oben. 7 Minuten Fußweg, Abfahrten unter 7 Minuten werden ausgeblendet. Ziel pro Zug aus der API (Seestadt oder Aspernstraße)
+- Haltestellen (eingestellt in `BLOCKS` in `src/main.cpp`, je 2 Blöcke = 1 Seite):
+  - U2 Museumsquartier Richtung Seestadt, RBL 4204, oben. Abfahrten unter 5 Minuten werden ausgeblendet (Fußweg, von Luca so eingestellt). Ziel pro Zug aus der API (Seestadt oder Aspernstraße)
   - 57A Köstlergasse Richtung Rudolfsheim Anschützgasse, RBL 8227, unten. Keine Gehzeit, Ziel wird als "Rudolfsheim" angezeigt
+  - Seite 2: U4 Kettenbrückengasse (4418 Hütteldorf, 4419 Heiligenstadt) und U3 Neubaugasse (4918 Ottakring, 4923 Simmering), je Richtung die nächste Abfahrt ab 5 Minuten
+  - Seite 3: 13A Richtung Hauptbahnhof und 14A Richtung Reumannplatz, beide Haus des Meeres RBL 668 (gleicher Steig, Filter nach Linienname), keine Gehzeit
+  - RBL Zuordnung der Steige über GTFS Koordinaten ermittelt, da die Live-API nachts leer war
+- Die Echtzeit-API liefert nur etwa die nächste Stunde. Haltestellen ohne Abfahrten fehlen nachts ganz in der Antwort, das ist kein Fehler
+- Fahrplan als Ersatz: Kommen für einen Steig keine Live-Daten (API Fehler, kein WLAN, nachts keine Abfahrten), zeigt die Linie die Zeiten aus dem Fahrplan. `include/fahrplan.h` wird von `tools/fahrplan.py` aus dem GTFS der Wiener Linien erzeugt (Steige und Ziele dort in `SOURCES`). Aktueller Fahrplan gültig bis 12.12.2026, nach jedem Fahrplanwechsel neu erzeugen
+- Fahrplan braucht die Uhrzeit (NTP). Nur wenn weder Live-Daten noch Uhrzeit da sind, kommt eine rote Fehlermeldung
 
 ## Wetter
 - Open-Meteo für Wien, kein API-Key nötig, Abfrage alle 15 Minuten
@@ -32,9 +38,11 @@ Kleines Display für zu Hause, das die aktuellen Abfahrtszeiten der Wiener Linie
 - Stil wie die U-Bahn Anzeigen der Wiener Linien: schwarzer Hintergrund, gelbe Schrift (RGB 255,230,0, am Display ausgewählt)
 - Schrift: U8g2_for_TFT_eSPI (wegen Umlauten), helvB (Helvetica fett), am Display ausgewählt
 - Kopfzeile: Wetter links, Uhrzeit (NTP, Wiener Zeit) rechts
-- Darunter 2 Hälften, je eine Linie: Liniennummer groß links, gelber Trennstrich, Haltestelle klein grau, 2 Zeilen mit Ziel in Großbuchstaben und Minuten rechts
+- Darunter 2 Hälften, je eine Linie (Punkte unten zeigen die Seite): Liniennummer groß links, gelber Trennstrich, Haltestelle klein grau, 2 Zeilen mit Ziel in Großbuchstaben und Minuten rechts
 - Alle Ziele in gleicher Schriftgröße (helvB14), nur bei zu langen Namen kleiner
-- Bei WLAN- oder API-Fehler eine klare Meldung anzeigen statt alte Daten
+- Touch (XPT2046, eigene Pins CS 33, IRQ 36, CLK 25, MOSI 32, MISO 39): runterwischen oder unten tippen = nächste Seite, rauf oder oben = vorige, nach 90 Sekunden zurück zu Seite 1
+- Grüner Punkt unter der Liniennummer = alle angezeigten Abfahrten sind live. Ohne Punkt sind es (teilweise) Fahrplanzeiten
+- Ab 60 Minuten wird statt Minuten die Uhrzeit angezeigt
 - Partition `huge_app.csv`, da Schriften viel Flash brauchen
 
 ## Arbeitsweise
