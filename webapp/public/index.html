@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="WG">
+<meta name="theme-color" content="#111111">
+<title>WG Display</title>
+<style>
+  :root {
+    --bg: #111;
+    --panel: #1d1d1d;
+    --line: #2c2c2c;
+    --led: #ffe600;
+    --text: #f2f2f2;
+    --dim: #8a8a8a;
+    --ok: #2ecc40;
+    --error: #ff5a4f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0 auto;
+    max-width: 520px;
+    padding: max(16px, env(safe-area-inset-top)) 16px 40px;
+    background: var(--bg);
+    color: var(--text);
+    font: 17px/1.4 -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+  h1 { margin: 8px 0 4px; font-size: 26px; color: var(--led); }
+  h2 { margin: 28px 0 8px; font-size: 15px; letter-spacing: .06em; text-transform: uppercase; color: var(--dim); }
+  .sub { margin: 0; color: var(--dim); font-size: 14px; }
+  .list { margin: 0; padding: 0; list-style: none; }
+  .list li {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 12px 0; border-bottom: 1px solid var(--line);
+  }
+  .list li:last-child { border-bottom: 0; }
+  .text { overflow-wrap: anywhere; }
+  .meta { display: block; font-size: 13px; color: var(--dim); }
+  .empty { color: var(--dim); padding: 8px 0; }
+  form { display: flex; gap: 8px; margin-top: 12px; }
+  form.column { flex-direction: column; }
+  input, select, textarea, button {
+    font: inherit; border: 0; border-radius: 12px; padding: 12px 14px;
+  }
+  input, select, textarea { flex: 1; min-width: 0; background: var(--panel); color: var(--text); }
+  textarea { resize: vertical; min-height: 64px; }
+  button { background: var(--led); color: #111; font-weight: 600; cursor: pointer; }
+  button.small { background: var(--panel); color: var(--led); font-weight: 500; padding: 8px 12px; flex: none; }
+  button:disabled { opacity: .5; }
+  .status { min-height: 20px; margin-top: 16px; font-size: 14px; color: var(--dim); }
+  .status.error { color: var(--error); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+  <h1>WG Display</h1>
+  <p class="sub">Einkaufsliste und Pinnwand, auch zu sehen am Display im Eingang.</p>
+
+  <section id="login" hidden>
+    <h2>Anmelden</h2>
+    <form id="login-form">
+      <input id="password" type="password" placeholder="WG-Passwort" autocomplete="current-password" required>
+      <button>Weiter</button>
+    </form>
+  </section>
+
+  <main id="app" hidden>
+    <h2>Einkaufsliste</h2>
+    <ul class="list" id="shopping"></ul>
+    <form id="shopping-form">
+      <input id="shopping-text" placeholder="z.B. Milch" required>
+      <button>Hinzufügen</button>
+    </form>
+
+    <h2>Pinnwand</h2>
+    <ul class="list" id="notes"></ul>
+    <form id="note-form" class="column">
+      <select id="note-author" aria-label="Von"></select>
+      <textarea id="note-text" placeholder="Nachricht an die WG" required></textarea>
+      <button>Anpinnen</button>
+    </form>
+    <p class="sub" id="note-hint"></p>
+  </main>
+
+  <p class="status" id="status" role="status"></p>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const store = {
+    get(key) { try { return localStorage.getItem(key); } catch { return null; } },
+    set(key, value) { try { localStorage.setItem(key, value); } catch {} },
+    remove(key) { try { localStorage.removeItem(key); } catch {} },
+  };
+  let password = store.get("wg-password") || "";
+  let busy = false;
+
+  function setStatus(text, isError = false) {
+    $("status").textContent = text;
+    $("status").className = isError ? "status error" : "status";
+  }
+
+  function showLogin(message) {
+    $("app").hidden = true;
+    $("login").hidden = false;
+    setStatus(message || "", Boolean(message));
+    $("password").focus();
+  }
+
+  async function api(path, options = {}) {
+    const response = await fetch(path, {
+      ...options,
+      headers: { "Content-Type": "application/json", "x-wg-password": password, ...(options.headers || {}) },
+    });
+    if (response.status === 401) {
+      store.remove("wg-password");
+      showLogin(password ? "Falsches Passwort" : "");
+      throw new Error("unauthorized");
+    }
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Fehler");
+    return data;
+  }
+
+  function formatTime(seconds) {
+    const date = new Date(seconds * 1000);
+    return date.toLocaleString("de-AT", { weekday: "short", hour: "2-digit", minute: "2-digit" });
+  }
+
+  // Elemente per DOM bauen, damit Text nie als HTML ausgeführt wird
+  function item(text, meta, buttonLabel, onClick) {
+    const li = document.createElement("li");
+    const span = document.createElement("span");
+    span.className = "text";
+    if (meta) {
+      const m = document.createElement("span");
+      m.className = "meta";
+      m.textContent = meta;
+      span.append(m);
+    }
+    span.append(document.createTextNode(text));
+    const button = document.createElement("button");
+    button.className = "small";
+    button.textContent = buttonLabel;
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try { render(await onClick()); } catch (e) { if (e.message !== "unauthorized") setStatus(e.message, true); }
+      button.disabled = false;
+    });
+    li.append(span, button);
+    return li;
+  }
+
+  function emptyItem(text) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = text;
+    return li;
+  }
+
+  function render(state) {
+    $("login").hidden = true;
+    $("app").hidden = false;
+
+    const shopping = $("shopping");
+    shopping.replaceChildren(...(state.shopping.length
+      ? state.shopping.map((s) => item(s.text, "", "Erledigt",
+          () => api(`/api/shopping?id=${encodeURIComponent(s.id)}`, { method: "DELETE" })))
+      : [emptyItem("Nichts zu kaufen")]));
+
+    const notes = $("notes");
+    const newestFirst = [...state.notes].reverse();
+    notes.replaceChildren(...(newestFirst.length
+      ? newestFirst.map((n) => item(n.text, `${n.author}, ${formatTime(n.time)}`, "Löschen",
+          () => api(`/api/notes?id=${encodeURIComponent(n.id)}`, { method: "DELETE" })))
+      : [emptyItem("Keine Nachrichten")]));
+
+    if (state.names) {
+      const select = $("note-author");
+      if (!select.options.length) {
+        for (const name of state.names) select.append(new Option(name, name));
+        select.value = store.get("wg-author") || state.names[0];
+      }
+    }
+    if (state.limits) {
+      $("shopping-text").maxLength = state.limits.shoppingLength;
+      $("note-text").maxLength = state.limits.noteLength;
+      $("note-hint").textContent = `Nachrichten verschwinden nach ${state.limits.noteDays} Tagen.`;
+    }
+    setStatus("");
+  }
+
+  async function refresh() {
+    if (!password || busy) return;
+    try { render(await api("/api/state")); }
+    catch (e) { if (e.message !== "unauthorized") setStatus("Keine Verbindung", true); }
+  }
+
+  async function submit(form, request) {
+    if (busy) return;
+    busy = true;
+    const button = form.querySelector("button");
+    button.disabled = true;
+    try { render(await request()); form.reset(); }
+    catch (e) { if (e.message !== "unauthorized") setStatus(e.message, true); }
+    button.disabled = false;
+    busy = false;
+  }
+
+  $("login-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    password = $("password").value;
+    store.set("wg-password", password);
+    refresh();
+  });
+
+  $("shopping-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const text = $("shopping-text").value;
+    submit(e.target, () => api("/api/shopping", { method: "POST", body: JSON.stringify({ text }) }));
+  });
+
+  $("note-author").addEventListener("change", (e) => store.set("wg-author", e.target.value));
+
+  $("note-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const author = $("note-author").value;
+    const text = $("note-text").value;
+    submit(e.target, () => api("/api/notes", { method: "POST", body: JSON.stringify({ author, text }) }))
+      .then(() => { $("note-author").value = author; });
+  });
+
+  // Aktuell halten, wenn jemand anderer etwas einträgt
+  setInterval(refresh, 30000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+
+  if (password) refresh(); else showLogin();
+</script>
+</body>
+</html>

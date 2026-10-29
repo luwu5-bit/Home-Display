@@ -1,0 +1,15 @@
+{
+  "name": "wg-display",
+  "private": true,
+  "type": "module",
+  "description": "Einkaufsliste und Pinnwand für die WG, angezeigt auf dem Öffi-Display",
+  "scripts": {
+    "dev": "node dev.mjs"
+  },
+  "dependencies": {
+    "@upstash/redis": "1.39.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -11,6 +11,7 @@ Kleines Display für zu Hause, das die aktuellen Abfahrtszeiten der Wiener Linie
 ## Software
 - VS Code mit PlatformIO, Framework Arduino
 - Bauen und Hochladen über die PlatformIO-Buttons in VS Code
+- Update über WLAN (ArduinoOTA): Umgebung `env:ota` in der Statusleiste wählen, dann Upload. Display heißt `oeffi-display.local`. Passwort in `secrets.ini` und `include/secrets.h` (beide gleich, beide in `.gitignore`). Standard bleibt `env:esp32dev` (USB)
 - Display-Bibliothek: TFT_eSPI oder LovyanGFX, Konfiguration passend zum E32R28T
 
 ## Datenquelle
@@ -19,11 +20,13 @@ Kleines Display für zu Hause, das die aktuellen Abfahrtszeiten der Wiener Linie
 - Haltestellen-IDs aus der offiziellen OGD-Haltepunkte-Liste der Wiener Linien
 - Abfrage etwa alle 30 bis 60 Sekunden, nicht öfter
 - Antworten mit `http.useHTTP10(true)` abfragen, sonst kommen sie "chunked" und ArduinoJson kann sie nicht lesen
+- Große Antworten (Abfahrten tagsüber ca. 40 KB) erst komplett mit `http.getString()` empfangen und dann parsen. Direkt aus `http.getStream()` lesen bricht ab ("IncompleteInput")
+- Kommen keine Live-Daten, steht unten links klein der Grund ("Fahrplan: ...")
 - Haltestellen (eingestellt in `BLOCKS` in `src/main.cpp`, je 2 Blöcke = 1 Seite):
   - U2 Museumsquartier Richtung Seestadt, RBL 4204, oben. Abfahrten unter 5 Minuten werden ausgeblendet (Fußweg, von Luca so eingestellt). Ziel pro Zug aus der API (Seestadt oder Aspernstraße)
   - 57A Köstlergasse Richtung Rudolfsheim Anschützgasse, RBL 8227, unten. Keine Gehzeit, Ziel wird als "Rudolfsheim" angezeigt
   - Seite 2: U4 Kettenbrückengasse (4418 Hütteldorf, 4419 Heiligenstadt) und U3 Neubaugasse (4918 Ottakring, 4923 Simmering), je Richtung die nächste Abfahrt ab 5 Minuten
-  - Seite 3: 13A Richtung Hauptbahnhof und 14A Richtung Reumannplatz, beide Haus des Meeres RBL 668 (gleicher Steig, Filter nach Linienname), keine Gehzeit
+  - Seite 3: 13A Richtung Hauptbahnhof und 14A Richtung Reumannplatz, beide Haus des Meeres RBL 668 (gleicher Steig, Filter nach Linienname), Abfahrten unter 4 Minuten werden ausgeblendet
   - RBL Zuordnung der Steige über GTFS Koordinaten ermittelt, da die Live-API nachts leer war
 - Die Echtzeit-API liefert nur etwa die nächste Stunde. Haltestellen ohne Abfahrten fehlen nachts ganz in der Antwort, das ist kein Fehler
 - Fahrplan als Ersatz: Kommen für einen Steig keine Live-Daten (API Fehler, kein WLAN, nachts keine Abfahrten), zeigt die Linie die Zeiten aus dem Fahrplan. `include/fahrplan.h` wird von `tools/fahrplan.py` aus dem GTFS der Wiener Linien erzeugt (Steige und Ziele dort in `SOURCES`). Aktueller Fahrplan gültig bis 12.12.2026, nach jedem Fahrplanwechsel neu erzeugen
@@ -41,9 +44,20 @@ Kleines Display für zu Hause, das die aktuellen Abfahrtszeiten der Wiener Linie
 - Darunter 2 Hälften, je eine Linie (Punkte unten zeigen die Seite): Liniennummer groß links, gelber Trennstrich, Haltestelle klein grau, 2 Zeilen mit Ziel in Großbuchstaben und Minuten rechts
 - Alle Ziele in gleicher Schriftgröße (helvB14), nur bei zu langen Namen kleiner
 - Touch (XPT2046, eigene Pins CS 33, IRQ 36, CLK 25, MOSI 32, MISO 39): runterwischen oder unten tippen = nächste Seite, rauf oder oben = vorige, nach 90 Sekunden zurück zu Seite 1
-- Grüner Punkt unter der Liniennummer = alle angezeigten Abfahrten sind live. Ohne Punkt sind es (teilweise) Fahrplanzeiten
+- Grüner Punkt rechts oben an jeder Abfahrtszeit = diese Abfahrt ist live. Ohne Punkt kommt sie aus dem Fahrplan
 - Ab 60 Minuten wird statt Minuten die Uhrzeit angezeigt
-- Partition `huge_app.csv`, da Schriften viel Flash brauchen
+- Energiesparen: Hintergrundbeleuchtung aus (PWM auf TFT_BL, Pin 21), Berührung macht hell, die erste Berührung wechselt keine Seite
+- Einstellungen: Zahnrad oben rechts, die ganze Kopfzeile antippen öffnet sie. Zeilen: Energiesparen am Tag (AN/AUS), Nachts dunkel 23 bis 6 Uhr (AN/AUS), Dunkel nach (30 s bis 30 min), Fertig. Nur die Tipp-Höhe zählt (robust auf resistivem Touch). Gespeichert mit Preferences im Flash
+- Partition `min_spiffs.csv` (zwei Programmplätze je 1,9 MB), nötig für Updates über WLAN
+
+## WG (Luca, Arthur, Daniel)
+- Einkaufsliste und Pinnwand als Web-App auf Vercel, Code im Ordner `webapp/` (statische Seite `public/index.html`, Funktionen in `api/`, Daten in Upstash Redis)
+- Handys: WG-Passwort (Vercel Umgebungsvariable `WG_PASSWORD`), wird im Browser gespeichert. Display: nur lesen über `GET /api/state` mit Header `x-display-key` (`DISPLAY_KEY`, gleicher Wert in `include/secrets.h`)
+- Display holt die Daten alle 30 Sekunden mit den Abfahrten, Adresse in `WEBAPP_URL` in `include/secrets.h`. Bei Fehlern steht der Grund rot rechts in der Überschrift der WG Seite
+- Seiten am Display: nach den Abfahrten "Einkaufsliste" (bis 8 Einträge) und "Pinnwand" (neueste zuerst, Name und Zeit, bis 2 Zeilen Text)
+- Grenzen in `webapp/lib/store.js`: 20 Einträge, 10 Nachrichten, Nachrichten verschwinden nach 7 Tagen
+- Lokal testen: im Ordner `webapp` `npm install` und `npm run dev`, dann http://localhost:3000 (Passwort "test")
+- "Wer ist zuhause" wurde wieder entfernt, wird nicht gebraucht
 
 ## Arbeitsweise
 - Luca ist Einsteiger bei Mikrocontrollern und arbeitet lieber mit grafischen Oberflächen als im Terminal: Schritte so erklären, dass sie in VS Code per Klick gehen

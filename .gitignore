@@ -7,3 +7,6 @@
 
 # WLAN Zugangsdaten
 include/secrets.h
+
+# Passwort fuer Updates ueber WLAN
+secrets.ini

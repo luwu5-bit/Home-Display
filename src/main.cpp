@@ -9,6 +9,8 @@
 #include <U8g2_for_TFT_eSPI.h>
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
+#include <ArduinoOTA.h>
+#include <Preferences.h>
 #include <time.h>
 #include "secrets.h"
 #include "fahrplan.h"  // erzeugt von tools/fahrplan.py
@@ -44,11 +46,21 @@ const Block BLOCKS[] = {
     {"U3", "Neubaugasse", 5, nullptr,
      {{4918, FP_U3_NEUBAUGASSE_OTTAKRING}, {4923, FP_U3_NEUBAUGASSE_SIMMERING}}},
     // Seite 3: 13A und 14A halten am selben Steig
-    {"13A", "Haus des Meeres", 0, nullptr, {{668, FP_13A_HAUS_DES_MEERES}}},
-    {"14A", "Haus des Meeres", 0, nullptr, {{668, FP_14A_HAUS_DES_MEERES}}},
+    {"13A", "Haus des Meeres", 4, nullptr, {{668, FP_13A_HAUS_DES_MEERES}}},
+    {"14A", "Haus des Meeres", 4, nullptr, {{668, FP_14A_HAUS_DES_MEERES}}},
 };
 const int BLOCK_COUNT = sizeof(BLOCKS) / sizeof(BLOCKS[0]);
-const int PAGE_COUNT = (BLOCK_COUNT + 1) / 2;
+const int DEPARTURE_PAGES = (BLOCK_COUNT + 1) / 2;
+const int SHOPPING_PAGE = DEPARTURE_PAGES;  // danach: Einkaufsliste
+const int NOTES_PAGE = DEPARTURE_PAGES + 1;     // und Pinnwand
+const int PAGE_COUNT = DEPARTURE_PAGES + 2;
+
+// WG: Einkaufsliste und Pinnwand
+const char *WG_NAMES[] = {"Luca", "Arthur", "Daniel"};
+const int WG_COUNT = sizeof(WG_NAMES) / sizeof(WG_NAMES[0]);
+// Eingetragen wird über die Web-App (Ordner webapp/), das Display holt sich die Daten von dort
+const int SHOPPING_MAX = 20;  // wie in webapp/lib/store.js
+const int NOTES_MAX = 10;
 
 // Touch (XPT2046, eigene Pins laut lcdwiki E32R28T)
 const int TOUCH_CS = 33;
@@ -57,8 +69,23 @@ const int TOUCH_SCLK = 25;
 const int TOUCH_MISO = 39;
 const int TOUCH_MOSI = 32;
 const bool TOUCH_FLIP_Y = false;  // auf true setzen, falls rauf und runter vertauscht sind
+const int TOUCH_Y_MIN = 300;      // Rohwert oben und unten am Bildschirmrand (ungefähr)
+const int TOUCH_Y_MAX = 3800;
 const int SWIPE_MIN = 800;        // Mindestweg für einen Wisch (Rohwerte 0 bis 4095)
 const unsigned long PAGE_TIMEOUT_MS = 90000;  // danach zurück zur ersten Seite
+
+// Energiesparen: Display wird dunkel, Berühren macht es hell.
+// Ob am Tag, ob nachts und nach welcher Zeit, lässt sich in den Einstellungen ändern.
+const int NIGHT_FROM_HOUR = 23;
+const int NIGHT_TO_HOUR = 6;
+const int DAY_BRIGHTNESS = 255;     // 0 bis 255
+const int SLEEP_BRIGHTNESS = 0;     // 0 = ganz aus, z.B. 20 = schwach leuchtend
+// Auswahl für "Dunkel nach" in Sekunden
+const int SLEEP_OPTIONS[] = {30, 60, 120, 300, 600, 1800};
+const int SLEEP_OPTION_COUNT = sizeof(SLEEP_OPTIONS) / sizeof(SLEEP_OPTIONS[0]);
+
+// Update über WLAN: in VS Code die Umgebung "env:ota" wählen und hochladen
+const char *OTA_HOSTNAME = "oeffi-display";  // im Netzwerk als oeffi-display.local
 
 const char *API_BASE = "https://www.wienerlinien.at/ogd_realtime/monitor?";
 const char *TIMEZONE = "CET-1CEST,M3.5.0,M10.5.0/3";  // Wien, mit Sommerzeit
@@ -95,10 +122,32 @@ struct Row {
 Row rows[BLOCK_COUNT];
 bool hasData = false;  // false = gerade wird eine Fehlermeldung angezeigt
 int currentPage = 0;
+bool inSettings = false;
+int brightness = DAY_BRIGHTNESS;
+
+// Einstellungen, gespeichert im Flash (bleiben nach Neustart und Update erhalten)
+Preferences prefs;
+bool daySaving = false;   // auch am Tag dunkel werden
+bool nightSaving = true;  // nachts dunkel
+int sleepOption = 1;      // Index in SLEEP_OPTIONS, 1 = 1 Minute
+
+// WG Daten aus der Web-App
+String shopping[SHOPPING_MAX];
+int shoppingCount = 0;
+
+struct Note {
+  time_t time;
+  String author;
+  String text;
+};
+Note notes[NOTES_MAX];  // älteste zuerst
+int noteCount = 0;
+String wgError;  // leer = Daten aus der Web-App sind aktuell
 unsigned long lastTouch = 0;
 unsigned long lastFetch = 0;
 unsigned long lastWeather = 0;
 String weatherText;  // leer = kein Wetter verfügbar
+String liveError;    // Grund, warum keine Live Daten kamen, leer = alles ok
 int lastClockMinute = -1;
 
 // Großbuchstaben, auch für Umlaute (UTF-8)
@@ -143,7 +192,17 @@ void showStatus(const char *line1, const char *line2, uint16_t color) {
   lastClockMinute = -1;
 }
 
-// Kopfzeile: Wetter links, Uhrzeit rechts
+// Zahnrad für die Einstellungen, Mitte bei (cx, cy)
+void drawGear(int cx, int cy, uint16_t color) {
+  for (int i = 0; i < 8; i++) {
+    float a = i * PI / 4;
+    tft.fillCircle(cx + round(cos(a) * 7), cy + round(sin(a) * 7), 2, color);
+  }
+  tft.fillCircle(cx, cy, 6, color);
+  tft.fillCircle(cx, cy, 2, TFT_BLACK);
+}
+
+// Kopfzeile: Wetter links, Uhrzeit und Zahnrad rechts
 void drawHeader() {
   struct tm now;
   char text[6] = "--:--";
@@ -152,10 +211,12 @@ void drawHeader() {
     lastClockMinute = now.tm_min;
   }
   tft.fillRect(0, 0, tft.width(), 28, TFT_BLACK);
-  drawRight(text, tft.width() - 8, 22, u8g2_font_helvB14_tf, COLOR_LED);
+  drawGear(tft.width() - 14, 15, COLOR_DIM);
+  const int clockRight = tft.width() - 30;
+  drawRight(text, clockRight, 22, u8g2_font_helvB14_tf, COLOR_LED);
 
   u8f.setFont(u8g2_font_helvB14_tf);
-  int maxWidth = tft.width() - 8 - u8f.getUTF8Width(text) - 16 - 8;
+  int maxWidth = clockRight - u8f.getUTF8Width(text) - 16 - 8;
   bool ok = weatherText.length() > 0;
   const char *weather = ok ? weatherText.c_str() : "Wetter nicht verfügbar";
   u8f.setFont(fitFont(weather, maxWidth));
@@ -231,7 +292,7 @@ bool connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return true;
 
   // Nur beim Start anzeigen, sonst bleiben die Abfahrten (Fahrplan) stehen
-  if (!hasData) showStatus("WLAN...", WIFI_SSID, COLOR_LED);
+  if (!hasData && !inSettings) showStatus("WLAN...", WIFI_SSID, COLOR_LED);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
@@ -278,11 +339,15 @@ String fetchDepartures(JsonDocument &doc) {
   fDep["departureTime"]["countdown"] = true;
   fDep["vehicle"]["towards"] = true;  // Ziel pro Zug (U2: Seestadt oder Aspernstraße)
 
-  DeserializationError err =
-      deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter),
-                      DeserializationOption::NestingLimit(20));
+  // Erst die ganze Antwort empfangen (tagsüber ca. 40 KB), dann auswerten.
+  // Direkt aus der Verbindung lesen bricht bei großen Antworten ab ("IncompleteInput").
+  String body = http.getString();
   http.end();
-  if (err) return String("JSON Fehler: ") + err.c_str();
+  if (body.length() == 0) return "Leere Antwort";
+
+  DeserializationError err = deserializeJson(doc, body, DeserializationOption::Filter(filter),
+                                             DeserializationOption::NestingLimit(20));
+  if (err) return String("JSON Fehler: ") + err.c_str() + " (" + body.length() + " Bytes)";
   return "";
 }
 
@@ -402,24 +467,17 @@ bool fillRows(JsonDocument *doc) {
 }
 
 // Ein Block pro Linie, wie die Anzeige am Bahnsteig:
-// Linie links, Trennstrich, Ziel, Minuten (oder Uhrzeit laut Fahrplan) rechts
+// Linie links, Trennstrich, Ziel, Minuten (oder Uhrzeit) rechts mit grünem Punkt, wenn live
 void drawBlock(const Block &b, const Row &r, int y, int h) {
   const int lineX = 72;  // Trennstrich
   const int destX = lineX + 10;
-  const int minutesRight = tft.width() - 8;
+  const int dotX = tft.width() - 8;           // grüner Punkt ganz rechts
+  const int minutesRight = dotX - 6;          // Minuten links davon, Platz für den Punkt
 
   // Linie links, senkrecht mittig
   u8f.setFont(u8g2_font_helvB24_tf);
   u8f.setForegroundColor(COLOR_LED);
   u8f.drawUTF8(8, y + h / 2 + 12, b.line);
-
-  // Grüner Punkt unter der Linie, wenn alle Abfahrten live sind
-  bool allLive = r.count > 0;
-  for (int k = 0; k < r.count; k++) allLive = allLive && r.live[k];
-  if (allLive) {
-    int lineWidth = u8f.getUTF8Width(b.line);
-    tft.fillCircle(8 + lineWidth / 2, y + h / 2 + 26, 3, COLOR_LIVE);
-  }
 
   // Trennstrich
   tft.drawFastVLine(lineX, y + 10, h - 20, COLOR_LED);
@@ -445,10 +503,110 @@ void drawBlock(const Block &b, const Row &r, int y, int h) {
     const uint8_t *whenFont = isTime ? u8g2_font_helvB18_tf : u8g2_font_helvB24_tf;
     drawRight(r.when[k].c_str(), minutesRight, baseline + 2, whenFont, COLOR_LED);
 
+    // Grüner Punkt rechts oben an der Zeit, wenn sie live ist (sonst Fahrplan)
+    if (r.live[k]) tft.fillCircle(dotX, baseline + 2 - (isTime ? 16 : 21), 3, COLOR_LIVE);
+
     int whenWidth = max(46, (int)u8f.getUTF8Width(r.when[k].c_str()) + 10);
     u8f.setFont(fitFont(r.towards[k].c_str(), minutesRight - whenWidth - destX));
     u8f.setForegroundColor(COLOR_LED);
     u8f.drawUTF8(destX, baseline, r.towards[k].c_str());
+  }
+}
+
+// WG Seiten: Einkaufsliste und Pinnwand, eingetragen über die Webseite am Handy
+const int WG_TOP = 32;
+
+// Überschrift der WG Seite, rechts die Adresse für die Handys
+void drawWgTitle(const char *title) {
+  u8f.setFont(u8g2_font_helvB10_tf);
+  u8f.setForegroundColor(COLOR_DIM);
+  u8f.drawUTF8(12, WG_TOP + 16, title);
+  if (wgError.length() > 0) {
+    drawRight(wgError.c_str(), tft.width() - 12, WG_TOP + 16, u8g2_font_helvB10_tf, COLOR_ERROR);
+  }
+}
+
+void drawEmptyHint(const char *text) {
+  u8f.setFont(u8g2_font_helvB14_tf);
+  u8f.setForegroundColor(COLOR_DIM);
+  u8f.drawUTF8(12, WG_TOP + 50, text);
+}
+
+void drawShoppingPage() {
+  drawWgTitle("Einkaufsliste");
+  if (shoppingCount == 0) return drawEmptyHint("Nichts zu kaufen");
+
+  // Bis zu 8 Einträge, bei mehr 7 und "+ N weitere"
+  const int lineH = 22;
+  int shown = shoppingCount <= 8 ? shoppingCount : 7;
+  u8f.setFont(u8g2_font_helvB14_tf);
+  for (int i = 0; i < shown; i++) {
+    int baseline = WG_TOP + 40 + i * lineH;
+    tft.fillCircle(16, baseline - 6, 3, COLOR_LED);
+    u8f.setForegroundColor(COLOR_LED);
+    u8f.drawUTF8(28, baseline, shopping[i].c_str());
+  }
+  if (shown < shoppingCount) {
+    u8f.setForegroundColor(COLOR_DIM);
+    u8f.drawUTF8(28, WG_TOP + 40 + 7 * lineH, ("+ " + String(shoppingCount - 7) + " weitere").c_str());
+  }
+}
+
+// Bricht Text an Leerzeichen in höchstens maxLines Zeilen um, die in maxWidth passen
+int wrapText(const String &text, int maxWidth, String lines[], int maxLines) {
+  int count = 0;
+  String line;
+  int start = 0;
+  while (start <= (int)text.length() && count < maxLines) {
+    int end = text.indexOf(' ', start);
+    if (end < 0) end = text.length();
+    String word = text.substring(start, end);
+    String candidate = line.length() ? line + " " + word : word;
+    if (line.length() && u8f.getUTF8Width(candidate.c_str()) > maxWidth) {
+      lines[count++] = line;
+      line = word;
+    } else {
+      line = candidate;
+    }
+    start = end + 1;
+  }
+  if (count < maxLines && line.length()) lines[count++] = line;
+  else if (line.length()) lines[maxLines - 1] += "...";  // passt nicht mehr ganz
+  return count;
+}
+
+void drawNotesPage() {
+  drawWgTitle("Pinnwand");
+  if (noteCount == 0) return drawEmptyHint("Keine Nachrichten");
+
+  // Neueste zuerst: Name und Zeit klein in Grau, darunter der Text (bis 2 Zeilen)
+  int y = WG_TOP + 24;
+  for (int i = noteCount - 1; i >= 0; i--) {
+    u8f.setFont(u8g2_font_helvB12_tf);
+    String lines[2];
+    int n = wrapText(notes[i].text, tft.width() - 24, lines, 2);
+    int needed = 14 + n * 18 + 6;
+    if (y + needed > tft.height() - 10) {
+      u8f.setFont(u8g2_font_helvB10_tf);
+      u8f.setForegroundColor(COLOR_DIM);
+      u8f.drawUTF8(12, y + 12, ("+ " + String(i + 1) + " ältere").c_str());
+      break;
+    }
+
+    char when[16] = "";
+    struct tm t;
+    if (localtime_r(&notes[i].time, &t)) {
+      const char *days[] = {"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"};
+      snprintf(when, sizeof(when), "%s %02d:%02d", days[t.tm_wday], t.tm_hour, t.tm_min);
+    }
+    u8f.setFont(u8g2_font_helvB10_tf);
+    u8f.setForegroundColor(COLOR_DIM);
+    u8f.drawUTF8(12, y + 12, (notes[i].author + ", " + when).c_str());
+
+    u8f.setFont(u8g2_font_helvB12_tf);
+    u8f.setForegroundColor(COLOR_LED);
+    for (int k = 0; k < n; k++) u8f.drawUTF8(12, y + 14 + (k + 1) * 18, lines[k].c_str());
+    y += needed;
   }
 }
 
@@ -457,14 +615,27 @@ void drawDepartures() {
   drawHeader();
   tft.drawFastHLine(0, 30, tft.width(), COLOR_DIM);
 
-  // 2 Blöcke pro Seite, der Bildschirm ist sonst zu voll
-  int blockH = (tft.height() - 32) / 2;
-  for (int k = 0; k < 2; k++) {
-    int i = currentPage * 2 + k;
-    if (i >= BLOCK_COUNT) break;
-    drawBlock(BLOCKS[i], rows[i], 32 + k * blockH, blockH);
+  if (currentPage == SHOPPING_PAGE) {
+    drawShoppingPage();
+  } else if (currentPage == NOTES_PAGE) {
+    drawNotesPage();
+  } else {
+    // 2 Blöcke pro Seite, der Bildschirm ist sonst zu voll
+    int blockH = (tft.height() - 32) / 2;
+    for (int k = 0; k < 2; k++) {
+      int i = currentPage * 2 + k;
+      if (i >= BLOCK_COUNT) break;
+      drawBlock(BLOCKS[i], rows[i], 32 + k * blockH, blockH);
+    }
+    tft.drawFastHLine(0, 32 + blockH, tft.width(), COLOR_DIM);
+
+    // Kamen keine Live Daten, steht unten links klein der Grund
+    if (liveError.length() > 0) {
+      u8f.setFont(u8g2_font_helvB08_tf);
+      u8f.setForegroundColor(COLOR_DIM);
+      u8f.drawUTF8(4, tft.height() - 2, ("Fahrplan: " + liveError).c_str());
+    }
   }
-  tft.drawFastHLine(0, 32 + blockH, tft.width(), COLOR_DIM);
 
   // Seitenanzeige: Punkte unten in der Mitte
   for (int p = 0; p < PAGE_COUNT; p++) {
@@ -473,15 +644,176 @@ void drawDepartures() {
   }
 }
 
+bool isWgPage(int page) { return page >= DEPARTURE_PAGES; }
+
 void showPage(int page) {
   currentPage = (page + PAGE_COUNT) % PAGE_COUNT;
+  if (hasData || isWgPage(currentPage)) drawDepartures();
+}
+
+// Holt Einkaufsliste und Pinnwand von der Web-App (nur lesen, mit dem Display-Schlüssel)
+void fetchWg() {
+  if (strlen(WEBAPP_URL) == 0) {
+    wgError = "Web-App fehlt";
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.useHTTP10(true);
+  if (!http.begin(client, String(WEBAPP_URL) + "/api/state")) {
+    wgError = "Nicht erreichbar";
+    return;
+  }
+  http.addHeader("x-display-key", DISPLAY_KEY);
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    wgError = code == 401 ? "Falscher Schlüssel" : "Fehler " + String(code);
+    return;
+  }
+  String body = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    wgError = "Ungültige Daten";
+    return;
+  }
+
+  shoppingCount = 0;
+  for (JsonObject item : doc["shopping"].as<JsonArray>()) {
+    if (shoppingCount == SHOPPING_MAX) break;
+    shopping[shoppingCount++] = item["text"].as<String>();
+  }
+  noteCount = 0;
+  for (JsonObject note : doc["notes"].as<JsonArray>()) {
+    if (noteCount == NOTES_MAX) break;
+    notes[noteCount++] = {(time_t)(note["time"] | 0L), note["author"].as<String>(),
+                          note["text"].as<String>()};
+  }
+  wgError = "";
+}
+
+// Einstellungen: 3 große Zeilen zum Antippen und "Fertig" unten.
+// Nur die Höhe der Berührung zählt, das ist auf dem resistiven Touch am zuverlässigsten.
+const int SETTINGS_TOP = 32;
+const int SETTINGS_ROW_H = 54;
+
+String sleepLabel() {
+  int s = SLEEP_OPTIONS[sleepOption];
+  return s < 60 ? String(s) + " s" : String(s / 60) + " min";
+}
+
+void drawSettingsRow(int row, const char *title, const char *hint, String value, bool on) {
+  int y = SETTINGS_TOP + row * SETTINGS_ROW_H;
+  u8f.setFont(u8g2_font_helvB14_tf);
+  u8f.setForegroundColor(COLOR_LED);
+  u8f.drawUTF8(12, y + 24, title);
+  u8f.setFont(u8g2_font_helvB08_tf);
+  u8f.setForegroundColor(COLOR_DIM);
+  u8f.drawUTF8(12, y + 42, hint);
+  drawRight(value.c_str(), tft.width() - 12, y + 32, u8g2_font_helvB18_tf, on ? COLOR_LIVE : COLOR_DIM);
+  tft.drawFastHLine(0, y + SETTINGS_ROW_H, tft.width(), COLOR_DIM);
+}
+
+void drawSettings() {
+  tft.fillScreen(TFT_BLACK);
+  u8f.setFont(u8g2_font_helvB14_tf);
+  u8f.setForegroundColor(COLOR_LED);
+  u8f.drawUTF8(12, 22, "Einstellungen");
+  drawGear(tft.width() - 14, 15, COLOR_LED);
+  tft.drawFastHLine(0, 30, tft.width(), COLOR_DIM);
+
+  drawSettingsRow(0, "Energiesparen am Tag", "Tippen zum Ein- und Ausschalten",
+                  daySaving ? "AN" : "AUS", daySaving);
+  drawSettingsRow(1, "Nachts dunkel (23-6 Uhr)", "Tippen zum Ein- und Ausschalten",
+                  nightSaving ? "AN" : "AUS", nightSaving);
+  drawSettingsRow(2, "Dunkel nach", "Tippen zum Ändern", sleepLabel(), true);
+
+  int y = SETTINGS_TOP + 3 * SETTINGS_ROW_H;
+  drawCentered("Fertig", y + (tft.height() - y) / 2 + 8, u8g2_font_helvB18_tf, COLOR_LED);
+}
+
+void saveSettings() {
+  prefs.putBool("daySaving", daySaving);
+  prefs.putBool("nightSaving", nightSaving);
+  prefs.putInt("sleepOption", sleepOption);
+}
+
+void openSettings() {
+  inSettings = true;
+  drawSettings();
+}
+
+void closeSettings() {
+  inSettings = false;
   if (hasData) drawDepartures();
 }
 
-// Touch auswerten: runterwischen oder unten tippen = nächste Seite,
-// raufwischen oder oben tippen = vorige Seite
+// Tippen in den Einstellungen, screenY = Höhe am Bildschirm
+void settingsTap(int screenY) {
+  int row = (screenY - SETTINGS_TOP) / SETTINGS_ROW_H;
+  if (screenY < SETTINGS_TOP) return;
+  if (row == 0) daySaving = !daySaving;
+  else if (row == 1) nightSaving = !nightSaving;
+  else if (row == 2) sleepOption = (sleepOption + 1) % SLEEP_OPTION_COUNT;
+  else {
+    closeSettings();
+    return;
+  }
+  saveSettings();
+  drawSettings();
+}
+
+void setBrightness(int value) {
+  if (value == brightness) return;
+  brightness = value;
+  ledcWrite(TFT_BL, value);
+}
+
+// Dunkel, wenn Energiesparen gerade gilt (am Tag und/oder nachts), außer kurz nach einer Berührung
+void updateBrightness() {
+  struct tm now;
+  bool night = getLocalTime(&now, 0) &&
+               (now.tm_hour >= NIGHT_FROM_HOUR || now.tm_hour < NIGHT_TO_HOUR);
+  bool saving = night ? nightSaving : daySaving;
+  bool awake = millis() - lastTouch < (unsigned long)SLEEP_OPTIONS[sleepOption] * 1000;
+  setBrightness(saving && !awake ? SLEEP_BRIGHTNESS : DAY_BRIGHTNESS);
+}
+
+void setupOta() {
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    setBrightness(DAY_BRIGHTNESS);
+    showStatus("Update...", "Bitte nicht ausstecken", COLOR_LED);
+  });
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    int w = tft.width() - 80;
+    tft.drawRect(40, tft.height() - 50, w, 12, COLOR_DIM);
+    tft.fillRect(42, tft.height() - 48, (w - 4) * done / total, 8, COLOR_LED);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    showStatus("Update Fehler", ("Fehler " + String(error)).c_str(), COLOR_ERROR);
+    hasData = false;  // beim nächsten Update wieder Abfahrten zeigen
+  });
+  ArduinoOTA.begin();
+  Serial.println(String("Update über WLAN bereit: ") + OTA_HOSTNAME + ".local");
+}
+
+// Touch Rohwert in Höhe am Bildschirm umrechnen (0 = oben)
+int toScreenY(int raw) {
+  return constrain(map(raw, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, tft.height()), 0, tft.height() - 1);
+}
+
+// Touch auswerten: Kopfzeile tippen = Einstellungen,
+// runterwischen oder unten tippen = nächste Seite, raufwischen oder oben tippen = vorige Seite
 void handleTouch() {
   static bool down = false;
+  static bool wakeOnly = false;  // Berührung hat nur das dunkle Display aufgeweckt
   static int startY = 0, lastY = 0;
   static unsigned long lastSeen = 0;
 
@@ -491,6 +823,8 @@ void handleTouch() {
     if (!down) {
       down = true;
       startY = y;
+      wakeOnly = brightness != DAY_BRIGHTNESS;
+      lastTouch = millis();  // sofort hell machen
     }
     lastY = y;
     lastSeen = millis();
@@ -501,12 +835,24 @@ void handleTouch() {
   if (!down || millis() - lastSeen < 80) return;
   down = false;
   lastTouch = millis();
+  if (wakeOnly) return;
 
   int dy = lastY - startY;
-  Serial.printf("Touch: Start y=%d, Ende y=%d\n", startY, lastY);
+  int screenY = toScreenY(startY);
+  Serial.printf("Touch: Start y=%d, Ende y=%d, Bildschirm y=%d\n", startY, lastY, screenY);
+
+  if (inSettings) {
+    if (abs(dy) < SWIPE_MIN) settingsTap(screenY);
+    return;
+  }
+  if (abs(dy) < SWIPE_MIN && screenY < 40) {
+    openSettings();  // Kopfzeile mit dem Zahnrad
+    return;
+  }
+
   if (dy > SWIPE_MIN) showPage(currentPage + 1);
   else if (dy < -SWIPE_MIN) showPage(currentPage - 1);
-  else if (startY > 2048) showPage(currentPage + 1);
+  else if (screenY > tft.height() / 2) showPage(currentPage + 1);
   else showPage(currentPage - 1);
 }
 
@@ -523,19 +869,24 @@ void update() {
     fetchWeather();
   }
 
+  if (wifiOk) fetchWg();
+  else wgError = "Kein WLAN";
+
   JsonDocument doc;
   if (wifiOk) error = fetchDepartures(doc);
   if (error.length() > 0) Serial.println("Keine Live Daten: " + error);
+  liveError = error;
+  Serial.printf("Freier Speicher: %lu Bytes\n", (unsigned long)ESP.getFreeHeap());
 
   if (!fillRows(error.length() == 0 ? &doc : nullptr)) {
     // Ohne Live Daten und ohne Uhrzeit geht auch der Fahrplan nicht
     hasData = false;
-    showStatus(wifiOk ? "API Fehler" : "WLAN Fehler", error.c_str(), COLOR_ERROR);
+    if (!inSettings) showStatus(wifiOk ? "API Fehler" : "WLAN Fehler", error.c_str(), COLOR_ERROR);
     return;
   }
 
   hasData = true;
-  drawDepartures();
+  if (!inSettings) drawDepartures();  // Einstellungen nicht überzeichnen
 }
 
 void setup() {
@@ -550,27 +901,50 @@ void setup() {
   touch.begin(touchSpi);
   touch.setRotation(3);  // wie das Display
 
+  // Hintergrundbeleuchtung per PWM, damit sie sich dimmen lässt
+  ledcAttach(TFT_BL, 5000, 8);
+  ledcWrite(TFT_BL, brightness);
+
+  prefs.begin("oeffi", false);
+  daySaving = prefs.getBool("daySaving", daySaving);
+  nightSaving = prefs.getBool("nightSaving", nightSaving);
+  sleepOption = constrain(prefs.getInt("sleepOption", sleepOption), 0, SLEEP_OPTION_COUNT - 1);
+
   connectWiFi();
   configTzTime(TIMEZONE, "pool.ntp.org");  // Uhrzeit aus dem Internet
 
   update();
   lastFetch = millis();
+  lastTouch = millis();  // nach dem Start erst einmal hell
 }
 
 void loop() {
+  // Update über WLAN starten, sobald das WLAN da ist
+  static bool otaReady = false;
+  if (!otaReady && WiFi.status() == WL_CONNECTED) {
+    setupOta();
+    otaReady = true;
+  }
+  if (otaReady) ArduinoOTA.handle();
+
   if (millis() - lastFetch >= REFRESH_MS) {
     lastFetch = millis();
     update();
   }
 
   handleTouch();
+  updateBrightness();
 
   // Nach einer Weile ohne Berührung zurück zur ersten Seite
-  if (currentPage != 0 && millis() - lastTouch >= PAGE_TIMEOUT_MS) showPage(0);
+  if (millis() - lastTouch >= PAGE_TIMEOUT_MS) {
+    if (inSettings) closeSettings();
+    if (currentPage != 0) showPage(0);
+  }
 
   // Uhr jede Minute neu zeichnen (nur wenn gerade Abfahrten angezeigt werden)
   struct tm now;
-  if (lastClockMinute >= 0 && getLocalTime(&now, 0) && now.tm_min != lastClockMinute) {
+  if (!inSettings && lastClockMinute >= 0 && getLocalTime(&now, 0) &&
+      now.tm_min != lastClockMinute) {
     drawHeader();
   }
   delay(20);
