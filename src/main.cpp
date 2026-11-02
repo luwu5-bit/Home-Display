@@ -10,7 +10,10 @@
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <ArduinoOTA.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/base64.h>
 #include <time.h>
 #include "secrets.h"
 #include "fahrplan.h"  // erzeugt von tools/fahrplan.py
@@ -53,7 +56,27 @@ const int BLOCK_COUNT = sizeof(BLOCKS) / sizeof(BLOCKS[0]);
 const int DEPARTURE_PAGES = (BLOCK_COUNT + 1) / 2;
 const int SHOPPING_PAGE = DEPARTURE_PAGES;  // danach: Einkaufsliste
 const int NOTES_PAGE = DEPARTURE_PAGES + 1;     // und Pinnwand
-const int PAGE_COUNT = DEPARTURE_PAGES + 2;
+const int LIGHT_PAGE = DEPARTURE_PAGES + 2;     // und Licht
+const int PAGE_COUNT = DEPARTURE_PAGES + 3;
+
+// Bereiche nebeneinander (links/rechts wechseln), darin Seiten untereinander (oben/unten)
+struct Section {
+  int first;  // erste Seite des Bereichs
+  int count;  // Anzahl Seiten
+};
+const Section SECTIONS[] = {
+    {0, DEPARTURE_PAGES},  // Öffi: die Stationen
+    {SHOPPING_PAGE, 2},    // WG: Einkaufsliste, Pinnwand
+    {LIGHT_PAGE, 1},       // Licht
+};
+const int SECTION_COUNT = sizeof(SECTIONS) / sizeof(SECTIONS[0]);
+
+int sectionOf(int page) {
+  for (int s = SECTION_COUNT - 1; s > 0; s--) {
+    if (page >= SECTIONS[s].first) return s;
+  }
+  return 0;
+}
 
 // WG: Einkaufsliste und Pinnwand
 const char *WG_NAMES[] = {"Luca", "Arthur", "Daniel"};
@@ -61,6 +84,13 @@ const int WG_COUNT = sizeof(WG_NAMES) / sizeof(WG_NAMES[0]);
 // Eingetragen wird über die Web-App (Ordner webapp/), das Display holt sich die Daten von dort
 const int SHOPPING_MAX = 20;  // wie in webapp/lib/store.js
 const int NOTES_MAX = 10;
+
+// IKEA DIRIGERA Hub: lokale API (HTTPS, Port 8443), Hub wird per mDNS gefunden.
+// Koppeln am Display, Zugangsschlüssel und Adresse werden im Flash gespeichert.
+const char *HUB_CLIENT_NAME = "oeffi-display";
+const unsigned long HUB_PAIR_MS = 60000;  // so lange wartet der Hub auf den Knopfdruck
+const int LIGHT_BUTTON_TOP = 76;          // Knopf "Alle Lichter aus", zwischen den Rändern
+const int LIGHT_BUTTON_H = 80;
 
 // Touch (XPT2046, eigene Pins laut lcdwiki E32R28T)
 const int TOUCH_CS = 33;
@@ -71,6 +101,10 @@ const int TOUCH_MOSI = 32;
 const bool TOUCH_FLIP_Y = false;  // auf true setzen, falls rauf und runter vertauscht sind
 const int TOUCH_Y_MIN = 300;      // Rohwert oben und unten am Bildschirmrand (ungefähr)
 const int TOUCH_Y_MAX = 3800;
+const bool TOUCH_FLIP_X = false;  // auf true setzen, falls links und rechts vertauscht sind
+const int TOUCH_X_MIN = 300;      // Rohwert links und rechts am Bildschirmrand (ungefähr)
+const int TOUCH_X_MAX = 3800;
+const int SIDE_ZONE = 64;         // Tippen am linken oder rechten Rand wechselt den Bereich
 const int SWIPE_MIN = 800;        // Mindestweg für einen Wisch (Rohwerte 0 bis 4095)
 const unsigned long PAGE_TIMEOUT_MS = 90000;  // danach zurück zur ersten Seite
 
@@ -143,6 +177,15 @@ struct Note {
 Note notes[NOTES_MAX];  // älteste zuerst
 int noteCount = 0;
 String wgError;  // leer = Daten aus der Web-App sind aktuell
+
+// DIRIGERA Hub
+String hubIp;        // leer = noch nicht gefunden
+String hubToken;     // leer = noch nicht gekoppelt
+String hubCode;      // laufende Kopplung: Code vom Hub, wartet auf den Knopfdruck
+String hubVerifier;  // Geheimnis zur laufenden Kopplung
+unsigned long hubPairStart = 0;
+String lightStatus;  // Ergebnis unter dem Knopf, z.B. "5 Lichter ausgeschaltet"
+uint16_t lightStatusColor = COLOR_DIM;
 unsigned long lastTouch = 0;
 unsigned long lastFetch = 0;
 unsigned long lastWeather = 0;
@@ -610,6 +653,37 @@ void drawNotesPage() {
   }
 }
 
+bool hubPairing() { return hubCode.length() > 0 && millis() - hubPairStart < HUB_PAIR_MS; }
+
+// Licht Seite: ein großer Knopf, darunter das Ergebnis
+void drawLightPage() {
+  u8f.setFont(u8g2_font_helvB10_tf);
+  u8f.setForegroundColor(COLOR_DIM);
+  u8f.drawUTF8(12, WG_TOP + 16, "Licht");
+
+  const char *label = "Alle Lichter aus";
+  const char *hint = "";
+  if (hubPairing()) {
+    label = "Fertig gedrückt";
+    hint = "Knopf auf dem Hub drücken, dann hier tippen";
+  } else if (hubToken.length() == 0) {
+    label = "Hub koppeln";
+    hint = "Einmalig nötig, dauert etwa eine Minute";
+  }
+
+  // Knopf nur in der Mitte, die Ränder wechseln den Bereich
+  const int x = SIDE_ZONE + 4;
+  const int w = tft.width() - 2 * x;
+  tft.drawRoundRect(x, LIGHT_BUTTON_TOP, w, LIGHT_BUTTON_H, 10, COLOR_LED);
+  tft.drawRoundRect(x + 1, LIGHT_BUTTON_TOP + 1, w - 2, LIGHT_BUTTON_H - 2, 9, COLOR_LED);
+  u8f.setFont(u8g2_font_helvB18_tf);
+  const uint8_t *font = u8f.getUTF8Width(label) <= w - 16 ? u8g2_font_helvB18_tf : u8g2_font_helvB14_tf;
+  drawCentered(label, LIGHT_BUTTON_TOP + LIGHT_BUTTON_H / 2 + 8, font, COLOR_LED);
+  drawCentered(hint, LIGHT_BUTTON_TOP + LIGHT_BUTTON_H + 24, u8g2_font_helvB10_tf, COLOR_DIM);
+  drawCentered(lightStatus.c_str(), LIGHT_BUTTON_TOP + LIGHT_BUTTON_H + 48, u8g2_font_helvB12_tf,
+               lightStatusColor);
+}
+
 void drawDepartures() {
   tft.fillScreen(TFT_BLACK);
   drawHeader();
@@ -619,6 +693,8 @@ void drawDepartures() {
     drawShoppingPage();
   } else if (currentPage == NOTES_PAGE) {
     drawNotesPage();
+  } else if (currentPage == LIGHT_PAGE) {
+    drawLightPage();
   } else {
     // 2 Blöcke pro Seite, der Bildschirm ist sonst zu voll
     int blockH = (tft.height() - 32) / 2;
@@ -638,17 +714,42 @@ void drawDepartures() {
   }
 
   // Seitenanzeige: Punkte unten in der Mitte
-  for (int p = 0; p < PAGE_COUNT; p++) {
-    int x = tft.width() / 2 + (p * 2 - (PAGE_COUNT - 1)) * 6;
-    tft.fillCircle(x, tft.height() - 5, 2, p == currentPage ? COLOR_LED : COLOR_DIM);
+  // Bereich: Punkte unten in der Mitte. Seite im Bereich: Punkte senkrecht am linken Rand.
+  int section = sectionOf(currentPage);
+  for (int s = 0; s < SECTION_COUNT; s++) {
+    int x = tft.width() / 2 + (s * 2 - (SECTION_COUNT - 1)) * 6;
+    tft.fillCircle(x, tft.height() - 5, 2, s == section ? COLOR_LED : COLOR_DIM);
+  }
+  const Section &sec = SECTIONS[section];
+  if (sec.count > 1) {
+    for (int p = 0; p < sec.count; p++) {
+      int y = tft.height() / 2 + 16 + (p * 2 - (sec.count - 1)) * 6;
+      tft.fillCircle(3, y, 2, sec.first + p == currentPage ? COLOR_LED : COLOR_DIM);
+    }
   }
 }
 
+// WG und Licht Seiten gehen auch ohne Abfahrten
 bool isWgPage(int page) { return page >= DEPARTURE_PAGES; }
 
 void showPage(int page) {
   currentPage = (page + PAGE_COUNT) % PAGE_COUNT;
+  lightStatus = "";  // altes Ergebnis nicht mehr anzeigen
   if (hasData || isWgPage(currentPage)) drawDepartures();
+}
+
+// Links/rechts: anderer Bereich, immer bei dessen erster Seite
+void showSection(int section) {
+  section = (section + SECTION_COUNT) % SECTION_COUNT;
+  showPage(SECTIONS[section].first);
+}
+
+// Oben/unten: nächste (+1) oder vorige (-1) Seite im Bereich, am Ende wieder von vorne
+void showSubPage(int delta) {
+  const Section &sec = SECTIONS[sectionOf(currentPage)];
+  if (sec.count < 2) return;
+  int sub = (currentPage - sec.first + delta + sec.count) % sec.count;
+  showPage(sec.first + sub);
 }
 
 // Holt Einkaufsliste und Pinnwand von der Web-App (nur lesen, mit dem Display-Schlüssel)
@@ -695,6 +796,174 @@ void fetchWg() {
                           note["text"].as<String>()};
   }
   wgError = "";
+}
+
+// Sucht den DIRIGERA Hub im WLAN (mDNS Dienst _ihsp._tcp).
+// mDNS läuft schon, ArduinoOTA hat es gestartet.
+bool findHub() {
+  int n = MDNS.queryService("ihsp", "tcp");
+  for (int i = 0; i < n; i++) {
+    IPAddress ip = MDNS.address(i);
+    if (ip == IPAddress()) ip = MDNS.queryHost(MDNS.hostname(i));
+    if (ip == IPAddress()) continue;
+    hubIp = ip.toString();
+    prefs.putString("hubIp", hubIp);
+    Serial.println("DIRIGERA Hub gefunden: " + hubIp);
+    return true;
+  }
+  return false;
+}
+
+// Eine Anfrage an den Hub. Der Hub hat ein eigenes Zertifikat, daher ohne Prüfung.
+// client und http über mehrere Anfragen behalten, dann bleibt die Verbindung offen (schneller).
+int hubRequest(WiFiClientSecure &client, HTTPClient &http, const char *method, const String &path,
+               const String &body, String &response) {
+  if (!http.begin(client, "https://" + hubIp + ":8443/v1/" + path)) return -1;
+  http.setTimeout(10000);
+  if (hubToken.length() > 0) http.addHeader("Authorization", "Bearer " + hubToken);
+  if (body.length() > 0) {
+    bool json = body[0] == '[' || body[0] == '{';
+    http.addHeader("Content-Type", json ? "application/json" : "application/x-www-form-urlencoded");
+  }
+  int code = http.sendRequest(method, body);
+  response = http.getString();
+  http.end();
+  return code;
+}
+
+// Koppeln Schritt 1: Code beim Hub anfordern, danach muss jemand den Knopf am Hub drücken
+String hubStartPairing() {
+  if (!findHub()) return "Hub nicht gefunden";
+
+  // Zufälliges Geheimnis, der Hub bekommt nur seinen SHA256 Wert (OAuth PKCE)
+  const char *alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+  hubVerifier = "";
+  for (int i = 0; i < 128; i++) hubVerifier += alphabet[esp_random() % 66];
+
+  uint8_t hash[32];
+  mbedtls_sha256((const uint8_t *)hubVerifier.c_str(), hubVerifier.length(), hash, 0);
+  unsigned char b64[48];
+  size_t len = 0;
+  mbedtls_base64_encode(b64, sizeof(b64), &len, hash, sizeof(hash));
+  String challenge = String((char *)b64).substring(0, len);
+  challenge.replace("+", "-");
+  challenge.replace("/", "_");
+  challenge.replace("=", "");
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  String response;
+  hubToken = "";
+  int code = hubRequest(client, http, "GET",
+                        "oauth/authorize?audience=homesmart.local&response_type=code"
+                        "&code_challenge_method=S256&code_challenge=" + challenge,
+                        "", response);
+  JsonDocument doc;
+  if (code != HTTP_CODE_OK || deserializeJson(doc, response) || !doc["code"].is<const char *>()) {
+    return "Hub Fehler " + String(code);
+  }
+  hubCode = doc["code"].as<String>();
+  hubPairStart = millis();
+  return "";
+}
+
+// Koppeln Schritt 2: nach dem Knopfdruck den Zugangsschlüssel abholen
+String hubFinishPairing() {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  String response;
+  int code = hubRequest(client, http, "POST", "oauth/token",
+                        "code=" + hubCode + "&name=" + HUB_CLIENT_NAME +
+                            "&grant_type=authorization_code&code_verifier=" + hubVerifier,
+                        response);
+  JsonDocument doc;
+  if (code != HTTP_CODE_OK || deserializeJson(doc, response) ||
+      !doc["access_token"].is<const char *>()) {
+    return "Knopf nicht erkannt, nochmal tippen";
+  }
+  hubCode = "";
+  hubToken = doc["access_token"].as<String>();
+  prefs.putString("hubToken", hubToken);
+  return "";
+}
+
+// Schaltet alle erreichbaren Lichter aus, die gerade an sind.
+// Gibt bei Erfolg einen leeren String zurück und das Ergebnis in result, sonst den Fehler.
+String hubAllLightsOff(String &result) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  String response;
+  int code = hubIp.length() > 0 ? hubRequest(client, http, "GET", "devices", "", response) : -1;
+  if (code < 0) {
+    // Hub hat vielleicht eine neue Adresse bekommen
+    if (!findHub()) return "Hub nicht gefunden";
+    code = hubRequest(client, http, "GET", "devices", "", response);
+  }
+  if (code == 401) {
+    hubToken = "";  // Kopplung wurde in der IKEA App entfernt
+    prefs.remove("hubToken");
+    return "Bitte neu koppeln";
+  }
+  if (code != HTTP_CODE_OK) return "Hub Fehler " + String(code);
+
+  // Nur die Felder einlesen, die wir brauchen
+  JsonDocument filter;
+  JsonObject f = filter[0].to<JsonObject>();
+  f["id"] = true;
+  f["deviceType"] = true;
+  f["isReachable"] = true;
+  f["attributes"]["isOn"] = true;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, response, DeserializationOption::Filter(filter));
+  response = "";  // Speicher freigeben
+  if (err) return String("JSON Fehler: ") + err.c_str();
+
+  int switched = 0, failed = 0;
+  for (JsonObject device : doc.as<JsonArray>()) {
+    if (device["deviceType"] != "light" || !(device["attributes"]["isOn"] | false)) continue;
+    if (!(device["isReachable"] | true)) continue;
+    code = hubRequest(client, http, "PATCH", "devices/" + device["id"].as<String>(),
+                      "[{\"attributes\":{\"isOn\":false}}]", response);
+    if (code >= 200 && code < 300) switched++;
+    else failed++;
+  }
+  if (failed > 0) return String(failed) + " Lichter nicht erreichbar";
+  if (switched == 0) result = "Alle Lichter waren schon aus";
+  else result = String(switched) + (switched == 1 ? " Licht" : " Lichter") + " ausgeschaltet";
+  return "";
+}
+
+// Tippen auf den Knopf der Licht Seite: koppeln oder alle Lichter aus
+void lightTap() {
+  if (WiFi.status() != WL_CONNECTED) {
+    lightStatus = "Kein WLAN";
+    lightStatusColor = COLOR_ERROR;
+    drawDepartures();
+    return;
+  }
+
+  lightStatus = hubToken.length() > 0 ? "Lichter werden ausgeschaltet..." : "Verbinde mit dem Hub...";
+  lightStatusColor = COLOR_DIM;
+  drawDepartures();
+
+  String error;
+  String result;
+  if (hubPairing()) {
+    error = hubFinishPairing();
+    result = "Gekoppelt";
+  } else if (hubToken.length() == 0) {
+    error = hubStartPairing();
+  } else {
+    error = hubAllLightsOff(result);
+  }
+
+  lightStatus = error.length() > 0 ? error : result;
+  lightStatusColor = error.length() > 0 ? COLOR_ERROR : COLOR_LIVE;
+  lastTouch = millis();  // nicht gleich dunkel werden oder zurückspringen
+  drawDepartures();
 }
 
 // Einstellungen: 3 große Zeilen zum Antippen und "Fertig" unten.
@@ -809,23 +1078,31 @@ int toScreenY(int raw) {
   return constrain(map(raw, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, tft.height()), 0, tft.height() - 1);
 }
 
+int toScreenX(int raw) {
+  return constrain(map(raw, TOUCH_X_MIN, TOUCH_X_MAX, 0, tft.width()), 0, tft.width() - 1);
+}
+
 // Touch auswerten: Kopfzeile tippen = Einstellungen,
-// runterwischen oder unten tippen = nächste Seite, raufwischen oder oben tippen = vorige Seite
+// rechter Rand oder nach links wischen = nächster Bereich, linker Rand oder nach rechts wischen = voriger,
+// in der Mitte unten tippen oder runterwischen = nächste Seite im Bereich, oben oder rauf = vorige
 void handleTouch() {
   static bool down = false;
   static bool wakeOnly = false;  // Berührung hat nur das dunkle Display aufgeweckt
-  static int startY = 0, lastY = 0;
+  static int startX = 0, startY = 0, lastX = 0, lastY = 0;
   static unsigned long lastSeen = 0;
 
   if (touch.touched()) {
     TS_Point p = touch.getPoint();
+    int x = TOUCH_FLIP_X ? 4095 - p.x : p.x;
     int y = TOUCH_FLIP_Y ? 4095 - p.y : p.y;
     if (!down) {
       down = true;
+      startX = x;
       startY = y;
       wakeOnly = brightness != DAY_BRIGHTNESS;
       lastTouch = millis();  // sofort hell machen
     }
+    lastX = x;
     lastY = y;
     lastSeen = millis();
     return;
@@ -837,23 +1114,43 @@ void handleTouch() {
   lastTouch = millis();
   if (wakeOnly) return;
 
+  int dx = lastX - startX;
   int dy = lastY - startY;
+  int screenX = toScreenX(startX);
   int screenY = toScreenY(startY);
-  Serial.printf("Touch: Start y=%d, Ende y=%d, Bildschirm y=%d\n", startY, lastY, screenY);
+  bool tap = abs(dx) < SWIPE_MIN && abs(dy) < SWIPE_MIN;
+  Serial.printf("Touch: Start x=%d y=%d, Ende x=%d y=%d, Bildschirm x=%d y=%d\n", startX, startY,
+                lastX, lastY, screenX, screenY);
 
   if (inSettings) {
     if (abs(dy) < SWIPE_MIN) settingsTap(screenY);
     return;
   }
-  if (abs(dy) < SWIPE_MIN && screenY < 40) {
+  if (tap && screenY < 40) {
     openSettings();  // Kopfzeile mit dem Zahnrad
     return;
   }
 
-  if (dy > SWIPE_MIN) showPage(currentPage + 1);
-  else if (dy < -SWIPE_MIN) showPage(currentPage - 1);
-  else if (screenY > tft.height() / 2) showPage(currentPage + 1);
-  else showPage(currentPage - 1);
+  // Wischen: die längere Richtung zählt
+  if (!tap) {
+    if (abs(dx) > abs(dy)) showSection(sectionOf(currentPage) + (dx < 0 ? 1 : -1));
+    else showSubPage(dy > 0 ? 1 : -1);
+    return;
+  }
+
+  // Tippen am Rand: Bereich wechseln
+  if (screenX >= tft.width() - SIDE_ZONE) return showSection(sectionOf(currentPage) + 1);
+  if (screenX < SIDE_ZONE) return showSection(sectionOf(currentPage) - 1);
+
+  // Knopf auf der Licht Seite
+  if (currentPage == LIGHT_PAGE && screenY >= LIGHT_BUTTON_TOP - 10 &&
+      screenY <= LIGHT_BUTTON_TOP + LIGHT_BUTTON_H + 10) {
+    lightTap();
+    return;
+  }
+
+  // Tippen in der Mitte: Seite im Bereich wechseln
+  showSubPage(screenY > tft.height() / 2 ? 1 : -1);
 }
 
 // Holt Live Daten und Wetter. Klappt das nicht, zeigen die Linien den Fahrplan.
@@ -909,6 +1206,8 @@ void setup() {
   daySaving = prefs.getBool("daySaving", daySaving);
   nightSaving = prefs.getBool("nightSaving", nightSaving);
   sleepOption = constrain(prefs.getInt("sleepOption", sleepOption), 0, SLEEP_OPTION_COUNT - 1);
+  hubIp = prefs.getString("hubIp", "");
+  hubToken = prefs.getString("hubToken", "");
 
   connectWiFi();
   configTzTime(TIMEZONE, "pool.ntp.org");  // Uhrzeit aus dem Internet

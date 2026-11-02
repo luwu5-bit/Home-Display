@@ -43,7 +43,11 @@ Kleines Display für zu Hause, das die aktuellen Abfahrtszeiten der Wiener Linie
 - Kopfzeile: Wetter links, Uhrzeit (NTP, Wiener Zeit) rechts
 - Darunter 2 Hälften, je eine Linie (Punkte unten zeigen die Seite): Liniennummer groß links, gelber Trennstrich, Haltestelle klein grau, 2 Zeilen mit Ziel in Großbuchstaben und Minuten rechts
 - Alle Ziele in gleicher Schriftgröße (helvB14), nur bei zu langen Namen kleiner
-- Touch (XPT2046, eigene Pins CS 33, IRQ 36, CLK 25, MOSI 32, MISO 39): runterwischen oder unten tippen = nächste Seite, rauf oder oben = vorige, nach 90 Sekunden zurück zu Seite 1
+- Touch (XPT2046, eigene Pins CS 33, IRQ 36, CLK 25, MOSI 32, MISO 39), nach 90 Sekunden zurück zu Öffi Seite 1
+- Navigation in 2 Richtungen (`SECTIONS` in `src/main.cpp`): Bereiche nebeneinander Öffi, WG, Licht. Rechter Rand tippen oder nach links wischen = nächster Bereich (immer dessen erste Seite), linker Rand oder nach rechts wischen = voriger. Ränder je 64 px (`SIDE_ZONE`)
+- Seiten im Bereich: Öffi die Stationsseiten, WG Einkaufsliste und Pinnwand. In der Mitte unten tippen oder runterwischen = nächste, oben oder rauf = vorige
+- Punkte unten in der Mitte = Bereich, senkrechte Punkte am linken Rand = Seite im Bereich
+- Touch X Kalibrierung geschätzt (`TOUCH_X_MIN/MAX`, `TOUCH_FLIP_X`), Rohwerte stehen im Serial Monitor
 - Grüner Punkt rechts oben an jeder Abfahrtszeit = diese Abfahrt ist live. Ohne Punkt kommt sie aus dem Fahrplan
 - Ab 60 Minuten wird statt Minuten die Uhrzeit angezeigt
 - Energiesparen: Hintergrundbeleuchtung aus (PWM auf TFT_BL, Pin 21), Berührung macht hell, die erste Berührung wechselt keine Seite
@@ -58,6 +62,12 @@ Kleines Display für zu Hause, das die aktuellen Abfahrtszeiten der Wiener Linie
 - Grenzen in `webapp/lib/store.js`: 20 Einträge, 10 Nachrichten, Nachrichten verschwinden nach 7 Tagen
 - Lokal testen: im Ordner `webapp` `npm install` und `npm run dev`, dann http://localhost:3000 (Passwort "test")
 - "Wer ist zuhause" wurde wieder entfernt, wird nicht gebraucht
+
+## Licht (IKEA DIRIGERA)
+- Bereich "Licht" (ganz rechts, von Öffi aus auch linker Rand): Knopf "Alle Lichter aus" in der Mitte zwischen den Rändern
+- Lokale API des Hubs: `https://<hub>:8443/v1/`, eigenes Zertifikat (`setInsecure`). Hub wird per mDNS gefunden (`_ihsp._tcp`, mDNS läuft über ArduinoOTA), Adresse in Preferences (`hubIp`)
+- Koppeln am Display (OAuth PKCE): "Hub koppeln" tippen, dann innerhalb von 60 Sekunden den Knopf auf dem Hub drücken und nochmal tippen. Zugangsschlüssel in Preferences (`hubToken`). Bei 401 wird er gelöscht und es heißt "Bitte neu koppeln"
+- Ausschalten: `GET devices`, dann `PATCH devices/<id>` mit `[{"attributes":{"isOn":false}}]` für jedes Licht, das an und erreichbar ist
 
 ## Arbeitsweise
 - Luca ist Einsteiger bei Mikrocontrollern und arbeitet lieber mit grafischen Oberflächen als im Terminal: Schritte so erklären, dass sie in VS Code per Klick gehen
