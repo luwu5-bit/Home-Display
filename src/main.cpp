@@ -89,8 +89,14 @@ const int NOTES_MAX = 10;
 // Koppeln am Display, Zugangsschlüssel und Adresse werden im Flash gespeichert.
 const char *HUB_CLIENT_NAME = "oeffi-display";
 const unsigned long HUB_PAIR_MS = 60000;  // so lange wartet der Hub auf den Knopfdruck
-const int LIGHT_BUTTON_TOP = 76;          // Knopf "Alle Lichter aus", zwischen den Rändern
+const int LIGHT_BUTTON_TOP = 76;          // Knopf "Hub koppeln", zwischen den Rändern
 const int LIGHT_BUTTON_H = 80;
+const int LIST_TOP = 48;                  // Seite 1 nur Schalter "Alle Lichter", danach je 2 Räume
+                                          // (Abstand zur Kopfzeile, die bis 40 px die Einstellungen öffnet)
+const int LIST_ROW_H = 60;                // groß genug für den resistiven Touch
+const char *TOP_ROOMS[] = {"Arthur", "Luca"};  // Räume, deren Name das enthält, stehen in dieser Reihenfolge oben
+const int LIST_ROWS = 2;                  // Räume pro Seite, darunter frei zum Weiterblättern
+const int DEVICES_MAX = 40;
 
 // Touch (XPT2046, eigene Pins laut lcdwiki E32R28T)
 const int TOUCH_CS = 33;
@@ -184,8 +190,22 @@ String hubToken;     // leer = noch nicht gekoppelt
 String hubCode;      // laufende Kopplung: Code vom Hub, wartet auf den Knopfdruck
 String hubVerifier;  // Geheimnis zur laufenden Kopplung
 unsigned long hubPairStart = 0;
-String lightStatus;  // Ergebnis unter dem Knopf, z.B. "5 Lichter ausgeschaltet"
+String lightStatus;  // Ergebnis unten auf der Seite, z.B. "5 Lichter ausgeschaltet"
 uint16_t lightStatusColor = COLOR_DIM;
+
+// Schaltbare Geräte am Hub (Lichter und Steckdosen, an den Steckdosen hängen Lampen), nach Raum sortiert
+struct Device {
+  String id;
+  String room;
+  bool isOn;
+  bool reachable;
+};
+Device devices[DEVICES_MAX];
+int deviceCount = 0;
+bool devicesLoaded = false;  // Liste wurde schon einmal geholt
+int rooms[DEVICES_MAX];      // je Raum das erste Gerät in devices
+int roomCount = 0;
+int lightScroll = 0;  // Seite der Licht Liste: 0 = Alle Lichter, ab 1 je LIST_ROWS Räume
 unsigned long lastTouch = 0;
 unsigned long lastFetch = 0;
 unsigned long lastWeather = 0;
@@ -655,20 +675,89 @@ void drawNotesPage() {
 
 bool hubPairing() { return hubCode.length() > 0 && millis() - hubPairStart < HUB_PAIR_MS; }
 
-// Licht Seite: ein großer Knopf, darunter das Ergebnis
+// Kürzt Text mit "...", bis er in maxWidth passt (aktuelle Schrift, Umlaute bleiben ganz)
+String ellipsize(String s, int maxWidth) {
+  if (u8f.getUTF8Width(s.c_str()) <= maxWidth) return s;
+  while (s.length() > 0 && u8f.getUTF8Width((s + "...").c_str()) > maxWidth) {
+    int i = s.length() - 1;
+    while (i > 0 && (s[i] & 0xC0) == 0x80) i--;  // Folgebytes eines Umlauts mitnehmen
+    s.remove(i);
+  }
+  return s + "...";
+}
+
+// Ist im Raum, der bei devices[first] beginnt, etwas an? first = -1: in allen Räumen
+bool anyOn(int first = -1) {
+  for (int i = first < 0 ? 0 : first; i < deviceCount; i++) {
+    if (first >= 0 && devices[i].room != devices[first].room) break;
+    if (devices[i].isOn && devices[i].reachable) return true;
+  }
+  return false;
+}
+
+// Ein Schalter über die ganze Breite: oben der Name, darunter AN (grün) oder AUS (grau), beides mittig.
+// big = großer Schalter "Alle Lichter" mit größerer Schrift.
+void drawSwitchRow(String label, bool on, int y, int h, bool big) {
+  const int x = SIDE_ZONE + 4;  // nur in der Mitte, die Ränder wechseln den Bereich
+  const int w = tft.width() - 2 * x;
+  tft.drawRoundRect(x, y + 4, w, h - 8, 10, on ? COLOR_LED : COLOR_DIM);
+  tft.drawRoundRect(x + 1, y + 5, w - 2, h - 10, 9, on ? COLOR_LED : COLOR_DIM);
+  const uint8_t *labelFont = big ? u8g2_font_helvB18_tf : u8g2_font_helvB14_tf;
+  const uint8_t *stateFont = big ? u8g2_font_helvB24_tf : u8g2_font_helvB14_tf;
+  int mid = y + h / 2;
+  u8f.setFont(labelFont);
+  drawCentered(ellipsize(label, w - 16).c_str(), big ? mid - 6 : mid - 2, labelFont, COLOR_LED);
+  drawCentered(on ? "AN" : "AUS", big ? mid + 30 : mid + 18, stateFont, on ? COLOR_LIVE : COLOR_DIM);
+}
+
+int lightPageCount() { return 1 + (roomCount + LIST_ROWS - 1) / LIST_ROWS; }
+
+// Licht Seite, gekoppelt: Seite 1 der große Schalter "Alle Lichter", danach je 2 Räume.
+// Darunter bleibt Platz zum Weiterblättern (tippen oder wischen) und für das Ergebnis.
+void drawDeviceList() {
+  if (lightScroll == 0) {
+    drawSwitchRow("Alle Lichter", anyOn(), LIST_TOP, LIST_ROWS * LIST_ROW_H, true);
+  } else {
+    for (int r = 0; r < LIST_ROWS; r++) {
+      int i = (lightScroll - 1) * LIST_ROWS + r;
+      if (i >= roomCount) break;
+      String room = devices[rooms[i]].room.length() > 0 ? devices[rooms[i]].room : "Ohne Raum";
+      drawSwitchRow(room, anyOn(rooms[i]), LIST_TOP + r * LIST_ROW_H, LIST_ROW_H, false);
+    }
+  }
+
+  int bottom = LIST_TOP + LIST_ROWS * LIST_ROW_H;
+  drawCentered(lightStatus.c_str(), bottom + 20, u8g2_font_helvB10_tf, lightStatusColor);
+
+  // Mehrere Seiten: Punkte senkrecht am linken Rand, Pfeile zum Blättern (links rauf, rechts runter)
+  int pages = lightPageCount();
+  if (!devicesLoaded) {
+    drawCentered("Lade Räume...", bottom + 46, u8g2_font_helvB10_tf, COLOR_DIM);
+  } else if (pages > 1) {
+    for (int p = 0; p < pages; p++) {
+      int y = tft.height() / 2 + 16 + (p * 2 - (pages - 1)) * 6;
+      tft.fillCircle(3, y, 2, p == lightScroll ? COLOR_LED : COLOR_DIM);
+    }
+    int cy = bottom + 44;
+    int up = tft.width() / 2 - 44, down = tft.width() / 2 + 44;
+    tft.fillTriangle(up - 12, cy + 7, up + 12, cy + 7, up, cy - 7, COLOR_DIM);
+    tft.fillTriangle(down - 12, cy - 7, down + 12, cy - 7, down, cy + 7, COLOR_DIM);
+  }
+}
+
+// Licht Seite: gekoppelt die Geräteliste, sonst ein großer Knopf zum Koppeln
 void drawLightPage() {
+  if (hubToken.length() > 0 && !hubPairing()) return drawDeviceList();
+
   u8f.setFont(u8g2_font_helvB10_tf);
   u8f.setForegroundColor(COLOR_DIM);
   u8f.drawUTF8(12, WG_TOP + 16, "Licht");
 
-  const char *label = "Alle Lichter aus";
-  const char *hint = "";
+  const char *label = "Hub koppeln";
+  const char *hint = "Einmalig nötig, dauert etwa eine Minute";
   if (hubPairing()) {
     label = "Fertig gedrückt";
     hint = "Knopf auf dem Hub drücken, dann hier tippen";
-  } else if (hubToken.length() == 0) {
-    label = "Hub koppeln";
-    hint = "Einmalig nötig, dauert etwa eine Minute";
   }
 
   // Knopf nur in der Mitte, die Ränder wechseln den Bereich
@@ -732,10 +821,25 @@ void drawDepartures() {
 // WG und Licht Seiten gehen auch ohne Abfahrten
 bool isWgPage(int page) { return page >= DEPARTURE_PAGES; }
 
+bool refreshDevices();
+
 void showPage(int page) {
   currentPage = (page + PAGE_COUNT) % PAGE_COUNT;
   lightStatus = "";  // altes Ergebnis nicht mehr anzeigen
+  lightScroll = 0;
   if (hasData || isWgPage(currentPage)) drawDepartures();
+  // Licht Seite: erst die alte Liste zeigen, dann den aktuellen Stand vom Hub holen
+  if (currentPage == LIGHT_PAGE && refreshDevices()) drawDepartures();
+}
+
+int lightPageCount();
+
+// Licht Liste weiterblättern: +1 nächste Seite, -1 vorige, am Ende wieder von vorne
+void scrollDevices(int delta) {
+  int pages = lightPageCount();
+  if (pages < 2) return;
+  lightScroll = (lightScroll + delta + pages) % pages;
+  drawDepartures();
 }
 
 // Links/rechts: anderer Bereich, immer bei dessen erster Seite
@@ -889,12 +993,38 @@ String hubFinishPairing() {
   return "";
 }
 
-// Schaltet alle erreichbaren Lichter aus, die gerade an sind.
-// Gibt bei Erfolg einen leeren String zurück und das Ergebnis in result, sonst den Fehler.
-String hubAllLightsOff(String &result) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
+// Fehlertext zu einer Antwort vom Hub. 401 = Kopplung wurde in der IKEA App entfernt.
+String hubError(int code) {
+  if (code == 401) {
+    hubToken = "";
+    prefs.remove("hubToken");
+    deviceCount = 0;
+    roomCount = 0;
+    devicesLoaded = false;
+    return "Bitte neu koppeln";
+  }
+  return code < 0 ? "Hub nicht erreichbar" : "Hub Fehler " + String(code);
+}
+
+// Platz eines Raums in der Liste: zuerst TOP_ROOMS, dann die übrigen, Geräte ohne Raum ganz unten
+int roomRank(const String &room) {
+  const int top = sizeof(TOP_ROOMS) / sizeof(TOP_ROOMS[0]);
+  if (room.length() == 0) return top + 1;
+  for (int i = 0; i < top; i++) {
+    if (room.indexOf(TOP_ROOMS[i]) >= 0) return i;
+  }
+  return top;
+}
+
+// Kommt a in der Liste vor b? Nach roomRank, sonst nach Name.
+bool deviceBefore(const Device &a, const Device &b) {
+  int ra = roomRank(a.room), rb = roomRank(b.room);
+  if (ra != rb) return ra < rb;
+  return a.room < b.room;
+}
+
+// Holt alle Lichter und Steckdosen vom Hub in devices. Gibt bei Erfolg einen leeren String zurück, sonst den Fehler.
+String hubFetchDevices(WiFiClientSecure &client, HTTPClient &http) {
   String response;
   int code = hubIp.length() > 0 ? hubRequest(client, http, "GET", "devices", "", response) : -1;
   if (code < 0) {
@@ -902,12 +1032,7 @@ String hubAllLightsOff(String &result) {
     if (!findHub()) return "Hub nicht gefunden";
     code = hubRequest(client, http, "GET", "devices", "", response);
   }
-  if (code == 401) {
-    hubToken = "";  // Kopplung wurde in der IKEA App entfernt
-    prefs.remove("hubToken");
-    return "Bitte neu koppeln";
-  }
-  if (code != HTTP_CODE_OK) return "Hub Fehler " + String(code);
+  if (code != HTTP_CODE_OK) return hubError(code);
 
   // Nur die Felder einlesen, die wir brauchen
   JsonDocument filter;
@@ -915,29 +1040,115 @@ String hubAllLightsOff(String &result) {
   f["id"] = true;
   f["deviceType"] = true;
   f["isReachable"] = true;
+  f["room"]["name"] = true;
   f["attributes"]["isOn"] = true;
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, response, DeserializationOption::Filter(filter));
   response = "";  // Speicher freigeben
   if (err) return String("JSON Fehler: ") + err.c_str();
 
-  int switched = 0, failed = 0;
-  for (JsonObject device : doc.as<JsonArray>()) {
-    if (device["deviceType"] != "light" || !(device["attributes"]["isOn"] | false)) continue;
-    if (!(device["isReachable"] | true)) continue;
-    code = hubRequest(client, http, "PATCH", "devices/" + device["id"].as<String>(),
-                      "[{\"attributes\":{\"isOn\":false}}]", response);
-    if (code >= 200 && code < 300) switched++;
-    else failed++;
+  deviceCount = 0;
+  for (JsonObject d : doc.as<JsonArray>()) {
+    if (deviceCount == DEVICES_MAX) break;
+    String type = d["deviceType"] | "";
+    if ((type != "light" && type != "outlet") || !d["attributes"]["isOn"].is<bool>()) continue;
+    Device &dev = devices[deviceCount++];
+    dev.id = d["id"].as<String>();
+    dev.room = d["room"]["name"] | "";
+    dev.reachable = d["isReachable"] | true;
+    dev.isOn = d["attributes"]["isOn"];
   }
-  if (failed > 0) return String(failed) + " Lichter nicht erreichbar";
-  if (switched == 0) result = "Alle Lichter waren schon aus";
-  else result = String(switched) + (switched == 1 ? " Licht" : " Lichter") + " ausgeschaltet";
+
+  // Sortieren (wenige Geräte, einfaches Einfügen reicht)
+  for (int i = 1; i < deviceCount; i++) {
+    for (int k = i; k > 0 && deviceBefore(devices[k], devices[k - 1]); k--) {
+      Device tmp = devices[k];
+      devices[k] = devices[k - 1];
+      devices[k - 1] = tmp;
+    }
+  }
+
+  roomCount = 0;
+  for (int i = 0; i < deviceCount; i++) {
+    if (i == 0 || devices[i].room != devices[i - 1].room) rooms[roomCount++] = i;
+  }
+  if (lightScroll >= lightPageCount()) lightScroll = 0;
+  devicesLoaded = true;
   return "";
 }
 
-// Tippen auf den Knopf der Licht Seite: koppeln oder alle Lichter aus
-void lightTap() {
+// Holt die Geräteliste neu, falls gekoppelt und WLAN da. Fehler stehen danach unten auf der Seite.
+// Gibt false zurück, wenn gar nicht gefragt wurde.
+bool refreshDevices() {
+  if (hubToken.length() == 0 || hubPairing() || WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  String error = hubFetchDevices(client, http);
+  if (error.length() > 0) {
+    lightStatus = error;
+    lightStatusColor = COLOR_ERROR;
+  } else if (lightStatusColor == COLOR_ERROR) {
+    lightStatus = "";  // alter Fehler ist erledigt
+  }
+  return true;
+}
+
+// Schaltet alle erreichbaren Lichter und Steckdosen ein oder aus (an den Steckdosen hängen Lampen),
+// bei oneRoom nur die im Raum room.
+// Gibt bei Erfolg einen leeren String zurück und das Ergebnis in result, sonst den Fehler.
+String hubSetAll(bool on, String &result, bool oneRoom = false, String room = "") {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  String error = hubFetchDevices(client, http);  // aktueller Stand, wer gerade an ist
+  if (error.length() > 0) return error;
+
+  String response;
+  int switched = 0, failed = 0;
+  for (int i = 0; i < deviceCount; i++) {
+    Device &d = devices[i];
+    if (d.isOn == on || !d.reachable || (oneRoom && d.room != room)) continue;
+    int code = hubRequest(client, http, "PATCH", "devices/" + d.id,
+                          on ? "[{\"attributes\":{\"isOn\":true}}]" : "[{\"attributes\":{\"isOn\":false}}]",
+                          response);
+    if (code >= 200 && code < 300) {
+      d.isOn = on;
+      switched++;
+    } else {
+      failed++;
+    }
+  }
+  if (failed > 0) return String(failed) + " nicht erreichbar";
+  if (switched == 0) result = on ? "War schon alles an" : "War schon alles aus";
+  else result = String(switched) + (switched == 1 ? " Lampe " : " Lampen ") + (on ? "eingeschaltet" : "ausgeschaltet");
+  return "";
+}
+
+// Tippen auf der Licht Seite, screenY = Höhe am Bildschirm.
+// Nicht gekoppelt: der große Knopf koppelt. Gekoppelt: Schalter "Alle Lichter" bzw. ein Raum,
+// ist etwas an, geht alles aus, sonst geht alles an.
+// Unter den Schaltern tippen: linke Hälfte = vorige Seite, rechte Hälfte = nächste.
+void lightTap(int screenX, int screenY) {
+  bool paired = hubToken.length() > 0 && !hubPairing();
+  int row = (screenY - LIST_TOP) / LIST_ROW_H;
+  bool oneRoom = false;
+  String room;
+  bool turnOn = !anyOn();
+  if (!paired) {
+    if (screenY < LIGHT_BUTTON_TOP - 10 || screenY > LIGHT_BUTTON_TOP + LIGHT_BUTTON_H + 10) return;
+  } else {
+    if (screenY < LIST_TOP) return;
+    if (row >= LIST_ROWS) return scrollDevices(screenX < tft.width() / 2 ? -1 : 1);
+    if (lightScroll > 0) {
+      int i = (lightScroll - 1) * LIST_ROWS + row;
+      if (i >= roomCount) return;
+      oneRoom = true;
+      room = devices[rooms[i]].room;
+      turnOn = !anyOn(rooms[i]);
+    }
+  }
+
   if (WiFi.status() != WL_CONNECTED) {
     lightStatus = "Kein WLAN";
     lightStatusColor = COLOR_ERROR;
@@ -945,23 +1156,27 @@ void lightTap() {
     return;
   }
 
-  lightStatus = hubToken.length() > 0 ? "Lichter werden ausgeschaltet..." : "Verbinde mit dem Hub...";
+  if (!paired) lightStatus = "Verbinde mit dem Hub...";
+  else lightStatus = turnOn ? "Wird eingeschaltet..." : "Wird ausgeschaltet...";
   lightStatusColor = COLOR_DIM;
   drawDepartures();
 
   String error;
   String result;
+  bool justPaired = false;
   if (hubPairing()) {
     error = hubFinishPairing();
     result = "Gekoppelt";
-  } else if (hubToken.length() == 0) {
+    justPaired = error.length() == 0;
+  } else if (!paired) {
     error = hubStartPairing();
   } else {
-    error = hubAllLightsOff(result);
+    error = hubSetAll(turnOn, result, oneRoom, room);
   }
 
   lightStatus = error.length() > 0 ? error : result;
   lightStatusColor = error.length() > 0 ? COLOR_ERROR : COLOR_LIVE;
+  if (justPaired) refreshDevices();
   lastTouch = millis();  // nicht gleich dunkel werden oder zurückspringen
   drawDepartures();
 }
@@ -1134,6 +1349,7 @@ void handleTouch() {
   // Wischen: die längere Richtung zählt
   if (!tap) {
     if (abs(dx) > abs(dy)) showSection(sectionOf(currentPage) + (dx < 0 ? 1 : -1));
+    else if (currentPage == LIGHT_PAGE) scrollDevices(dy > 0 ? 1 : -1);
     else showSubPage(dy > 0 ? 1 : -1);
     return;
   }
@@ -1142,12 +1358,8 @@ void handleTouch() {
   if (screenX >= tft.width() - SIDE_ZONE) return showSection(sectionOf(currentPage) + 1);
   if (screenX < SIDE_ZONE) return showSection(sectionOf(currentPage) - 1);
 
-  // Knopf auf der Licht Seite
-  if (currentPage == LIGHT_PAGE && screenY >= LIGHT_BUTTON_TOP - 10 &&
-      screenY <= LIGHT_BUTTON_TOP + LIGHT_BUTTON_H + 10) {
-    lightTap();
-    return;
-  }
+  // Licht Seite: Knöpfe und Geräte
+  if (currentPage == LIGHT_PAGE) return lightTap(screenX, screenY);
 
   // Tippen in der Mitte: Seite im Bereich wechseln
   showSubPage(screenY > tft.height() / 2 ? 1 : -1);
@@ -1168,6 +1380,7 @@ void update() {
 
   if (wifiOk) fetchWg();
   else wgError = "Kein WLAN";
+  if (currentPage == LIGHT_PAGE && !inSettings) refreshDevices();  // Licht auch per App geschaltet
 
   JsonDocument doc;
   if (wifiOk) error = fetchDepartures(doc);

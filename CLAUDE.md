@@ -64,10 +64,14 @@ Kleines Display für zu Hause, das die aktuellen Abfahrtszeiten der Wiener Linie
 - "Wer ist zuhause" wurde wieder entfernt, wird nicht gebraucht
 
 ## Licht (IKEA DIRIGERA)
-- Bereich "Licht" (ganz rechts, von Öffi aus auch linker Rand): Knopf "Alle Lichter aus" in der Mitte zwischen den Rändern
+- Bereich "Licht" (ganz rechts, von Öffi aus auch linker Rand), alles in der Mitte zwischen den Rändern:
+  - Nur große An/Aus Schalter (einzelne Geräte waren auf dem resistiven Touch zu eng). Seite 1 nur der große Schalter "Alle Lichter", danach je 2 Räume pro Seite. In jedem Schalter oben der Name, darunter AN/AUS, beides mittig. Unter den Schaltern bleibt Platz mit 2 Pfeilen: links tippen (Pfeil rauf) = vorige Seite, rechts (Pfeil runter) = nächste, rauf und runter wischen blättert auch (Punkte links), am Ende wieder Seite 1
+  - Gilt für Lichter und Steckdosen (an den Steckdosen hängen Lampen). Schalter zeigt AN, wenn im Raum bzw. irgendwo etwas an ist. Antippen: ist etwas an, geht alles aus, sonst geht alles an
+  - Reihenfolge: zuerst Arthurs Zimmer, dann Lucas Zimmer (`TOP_ROOMS` in `src/main.cpp`, Teil des Namens reicht), dann die übrigen nach Name, Geräte ohne Raum als "Ohne Raum" ganz unten. Liste beginnt erst bei 48 px, weil die Kopfzeile bis 40 px die Einstellungen öffnet. Sensoren und Fernbedienungen werden nicht angezeigt
+  - Liste wird beim Öffnen der Seite und alle 30 Sekunden neu geholt, solange die Seite offen ist. Meldungen unter den Schaltern in der Mitte
 - Lokale API des Hubs: `https://<hub>:8443/v1/`, eigenes Zertifikat (`setInsecure`). Hub wird per mDNS gefunden (`_ihsp._tcp`, mDNS läuft über ArduinoOTA), Adresse in Preferences (`hubIp`)
 - Koppeln am Display (OAuth PKCE): "Hub koppeln" tippen, dann innerhalb von 60 Sekunden den Knopf auf dem Hub drücken und nochmal tippen. Zugangsschlüssel in Preferences (`hubToken`). Bei 401 wird er gelöscht und es heißt "Bitte neu koppeln"
-- Ausschalten: `GET devices`, dann `PATCH devices/<id>` mit `[{"attributes":{"isOn":false}}]` für jedes Licht, das an und erreichbar ist
+- Geräte: `GET devices`. Schalten: `PATCH devices/<id>` mit `[{"attributes":{"isOn":false}}]` (bzw. `true`), für jedes Licht und jede Steckdose im Raum (bzw. überall), die erreichbar ist
 
 ## Arbeitsweise
 - Luca ist Einsteiger bei Mikrocontrollern und arbeitet lieber mit grafischen Oberflächen als im Terminal: Schritte so erklären, dass sie in VS Code per Klick gehen
